@@ -1,0 +1,30 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Tue, 8 Apr 2025 14:25:50 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: refactor IRQ get to avoid false
+ status alerts
+
+Refactor WED IRQ retrieval logic to prevent false positive status
+alerts during normal operation.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-wed-14-refactor-mtk_wed_irq_get-to-avoid-wed-status-false-a.patch
+[plcharriere: restrict the change to WED 3.1, so that WED v3 keeps
+TKID_WO_PYLD in its error mask]
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -3114,7 +3114,9 @@ mtk_wed_irq_get(struct mtk_wed_device *d
+ {
+ 	u32 val, ext_mask;
+ 
+-	if (mtk_wed_is_v3_or_greater(dev->hw))
++	if (mtk_wed_is_v3_1(dev->hw))
++		ext_mask = MTK_WED_EXT_INT_STATUS_RX_DRV_COHERENT;
++	else if (mtk_wed_is_v3(dev->hw))
+ 		ext_mask = MTK_WED_EXT_INT_STATUS_RX_DRV_COHERENT |
+ 			   MTK_WED_EXT_INT_STATUS_TKID_WO_PYLD;
+ 	else

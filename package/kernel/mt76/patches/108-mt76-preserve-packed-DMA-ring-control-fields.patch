@@ -1,0 +1,124 @@
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Fri, 19 Sep 2025 17:23:27 +0800
+Subject: [PATCH 46/89] mtk: mt76: add mask for Q_READ and Q_WRITE
+
+After mt7990 and connac5 chipsets, some bit fields of ring control
+registers are used for other purpose, so we need to consider mask to
+prevent from reading or writing wrong value.
+
+This fixes "WED off + HWRRO on" issue on mt7990.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0046-mtk-mt76-add-mask-for-Q_READ-and-Q_WRITE.patch
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+[plcharriere: rebase onto mt76_dma_handle_read()/write() and
+mt76_dma_read_dma_idx(); convert the npu.c DMA index write as well]
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ dma.c  | 15 ++++++++-------
+ dma.h  | 12 +++++++-----
+ mt76.h |  5 +++++
+ npu.c  |  2 +-
+ 4 files changed, 21 insertions(+), 13 deletions(-)
+
+--- a/dma.c
++++ b/dma.c
+@@ -193,7 +193,7 @@ mt76_dma_queue_magic_cnt_init(struct mt7
+ static int
+ mt76_dma_read_dma_idx(struct mt76_queue *q, int fallback)
+ {
+-	u32 idx = Q_READ(q, dma_idx);
++	u32 idx = Q_READ(q, dma_idx, MT_QUEUE_DMA_IDX);
+ 
+ 	return idx < q->ndesc ? idx : fallback;
+ }
+@@ -203,16 +203,17 @@ mt76_dma_sync_idx(struct mt76_dev *dev,
+ {
+ 	if ((q->flags & MT_QFLAG_WED_RRO_EN) &&
+ 	    (!is_mt7992(dev) || !mt76_npu_device_active(dev)))
+-		Q_WRITE(q, ring_size, MT_DMA_RRO_EN | q->ndesc);
++		Q_WRITE(q, ring_size, MT_DMA_RRO_EN | q->ndesc,
++			MT_QUEUE_RING_SIZE);
+ 	else
+-		Q_WRITE(q, ring_size, q->ndesc);
++		Q_WRITE(q, ring_size, q->ndesc, MT_QUEUE_RING_SIZE);
+ 
+ 	if (mt76_queue_is_npu_tx(q)) {
+ 		writel(q->ndesc, &q->regs->ring_size);
+ 		writel(q->desc_dma, &q->regs->desc_base);
+ 	}
+ 
+-	Q_WRITE(q, desc_base, q->desc_dma);
++	Q_WRITE(q, desc_base, q->desc_dma, MT_QUEUE_DESC_BASE);
+ 
+ 	q->head = mt76_dma_read_dma_idx(q, 0);
+ 	q->tail = q->head;
+@@ -238,8 +239,8 @@ void mt76_dma_queue_reset(struct mt76_de
+ 		if (mt76_queue_is_emi(q))
+ 			*q->emi_cpu_idx = 0;
+ 		else
+-			Q_WRITE(q, cpu_idx, 0);
+-		Q_WRITE(q, dma_idx, 0);
++			Q_WRITE(q, cpu_idx, 0, MT_QUEUE_CPU_IDX);
++		Q_WRITE(q, dma_idx, 0, GENMASK(31, 0));
+ 	}
+ 	mt76_dma_sync_idx(dev, q);
+ }
+@@ -416,7 +417,7 @@ mt76_dma_kick_queue(struct mt76_dev *dev
+ 	if (mt76_queue_is_emi(q))
+ 		*q->emi_cpu_idx = cpu_to_le16(q->head);
+ 	else
+-		Q_WRITE(q, cpu_idx, q->head);
++		Q_WRITE(q, cpu_idx, q->head, MT_QUEUE_CPU_IDX);
+ }
+ 
+ static void
+--- a/dma.h
++++ b/dma.h
+@@ -103,16 +103,18 @@ mt76_dma_handle_write(struct mt76_queue
+ 	return false;
+ }
+ 
+-#define Q_READ(_q, _field) ({						\
++#define Q_READ(_q, _field, _mask) ({					\
+ 	u32 _offset = offsetof(struct mt76_queue_regs, _field);		\
+ 	u32 _val;							\
+ 	if (!mt76_dma_handle_read(_q, _offset, &_val))			\
+ 		_val = readl(&(_q)->regs->_field);			\
+-	_val;								\
++	(_mask) ? FIELD_GET(_mask, _val) : _val;			\
+ })
+ 
+-#define Q_WRITE(_q, _field, _val)	do {				\
++#define Q_WRITE(_q, _field, _v, _mask)	do {			\
+ 	u32 _offset = offsetof(struct mt76_queue_regs, _field);		\
++	u32 _val = Q_READ(_q, _field, 0);				\
++	_val = (_val & ~(_mask)) | FIELD_PREP(_mask, _v);		\
+ 	if (!mt76_dma_handle_write(_q, _offset, _val))			\
+ 		writel(_val, &(_q)->regs->_field);			\
+ } while (0)
+--- a/mt76.h
++++ b/mt76.h
+@@ -234,6 +234,11 @@ struct mt76_queue_entry {
+ 	bool done:1;
+ };
+ 
++#define MT_QUEUE_DESC_BASE	GENMASK(31, 0)
++#define MT_QUEUE_RING_SIZE	GENMASK(15, 0)
++#define MT_QUEUE_CPU_IDX	GENMASK(11, 0)
++#define MT_QUEUE_DMA_IDX	GENMASK(11, 0)
++
+ struct mt76_queue_regs {
+ 	u32 desc_base;
+ 	u32 ring_size;
+--- a/npu.c
++++ b/npu.c
+@@ -108,7 +108,7 @@ static struct sk_buff *mt76_npu_dequeue(
+ 	}
+ 	q->tail = index;
+ 	q->queued -= i;
+-	Q_WRITE(q, dma_idx, q->tail);
++	Q_WRITE(q, dma_idx, q->tail, MT_QUEUE_DMA_IDX);
+ 
+ 	return skb;
+ }

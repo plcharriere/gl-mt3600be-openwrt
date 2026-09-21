@@ -1,0 +1,109 @@
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Mon, 2 Mar 2026 17:17:28 +0800
+Subject: [PATCH] wifi: mt76: mt7996: separate WED and software token ranges
+
+WED allocates its hardware TX buffers with token IDs starting at zero.
+The software TX path currently allocates from the same range when WED uses
+all 16384 hardware tokens, so WED can consume completions of
+software-owned data tokens.
+
+Reserve IDs 0..16383 for WED and allocate software tokens from
+16384..31743.  The highest 1024 values remain unused, including 0x7fff,
+which the TX-free format reserves as the invalid MSDU ID.
+
+Keep the software pool available when flow offload is enabled.  Limiting
+it to wed->wlan.token_start was appropriate when software occupied the
+range below WED, but that boundary is now the start of the software range.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0054-mtk-mt76-add-debug-tools.patch
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+[plcharriere: token layout only, keeping MT7996_HW_TOKEN_SIZE; keep the
+software tokens below the WED range when it starts above them, as on
+mt7915; count only tokens inside the WED range in wed_token_count]
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mmio.c   | 6 ++++--
+ mt7996/mt7996.h | 2 +-
+ wed.c           | 6 +++++-
+ tx.c            | 5 ++++-
+ 4 files changed, 14 insertions(+), 5 deletions(-)
+
+--- a/mt7996/mmio.c
++++ b/mt7996/mmio.c
+@@ -679,7 +679,7 @@ int mt7996_mmio_wed_init(struct mt7996_d
+ 	}
+ 
+ 	wed->wlan.nbuf = tx_token_size;
+-	wed->wlan.token_start = MT7996_TOKEN_SIZE - wed->wlan.nbuf;
++	wed->wlan.token_start = 0;
+ 	wed->wlan.hif2 = hif2;
+ 
+ 	wed->wlan.amsdu_max_subframes = 8;
+@@ -703,6 +703,8 @@ int mt7996_mmio_wed_init(struct mt7996_d
+ 		dev->mt76.rx_token_size = tx_token_size + rx_token_size;
+ 	}
+ 
++	dev->mt76.token_start = wed->wlan.nbuf;
++
+ 	*irq = wed->irq;
+ 	dev->mt76.dma_dev = wed->dev;
+ 
+@@ -915,7 +917,7 @@ struct mt7996_dev *mt7996_mmio_probe(str
+ 		.survey_flags = SURVEY_INFO_TIME_TX |
+ 				SURVEY_INFO_TIME_RX |
+ 				SURVEY_INFO_TIME_BSS_RX,
+-		.token_size = MT7996_TOKEN_SIZE,
++		.token_size = MT7996_SW_TOKEN_SIZE,
+ 		.tx_prepare_skb = mt7996_tx_prepare_skb,
+ 		.tx_complete_skb = mt76_connac_tx_complete_skb,
+ 		.rx_skb = mt7996_queue_rx_skb,
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -92,9 +92,9 @@
+ #define MT7996_EEPROM_SIZE		7680
+ #define MT7996_EEPROM_BLOCK_SIZE	16
+ #define MT7996_EXT_EEPROM_BLOCK_SIZE	1024
+-#define MT7996_TOKEN_SIZE		16384
+ #define MT7996_HW_TOKEN_SIZE		8192
+ #define MT7996_WED_TOKEN_SIZE		16384
++#define MT7996_SW_TOKEN_SIZE		15360
+ 
+ #define MT7996_CFEND_RATE_DEFAULT	0x49	/* OFDM 24M */
+ #define MT7996_CFEND_RATE_11B		0x03	/* 11B LP, 11M */
+--- a/wed.c
++++ b/wed.c
+@@ -88,7 +88,11 @@ int mt76_wed_offload_enable(struct mtk_w
+ 	struct mt76_dev *dev = mt76_wed_to_dev(wed);
+ 
+ 	spin_lock_bh(&dev->token_lock);
+-	dev->token_size = wed->wlan.token_start;
++	/* keep software tokens below a WED range that starts above them */
++	if (wed->wlan.token_start > dev->token_start)
++		dev->token_size = wed->wlan.token_start - dev->token_start;
++	else
++		dev->token_size = dev->drv->token_size;
+ 	spin_unlock_bh(&dev->token_lock);
+ 
+ 	return !wait_event_timeout(dev->tx_wait, !dev->wed_token_count, HZ);
+--- a/tx.c
++++ b/tx.c
+@@ -969,7 +969,8 @@ int mt76_token_consume(struct mt76_dev *
+ 
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 	if (mtk_wed_device_active(&dev->mmio.wed) &&
+-	    token >= dev->mmio.wed.wlan.token_start)
++	    token >= dev->mmio.wed.wlan.token_start &&
++	    token < dev->mmio.wed.wlan.token_start + dev->mmio.wed.wlan.nbuf)
+ 		dev->wed_token_count++;
+ #endif
+ 
+@@ -1020,6 +1021,8 @@ mt76_token_release(struct mt76_dev *dev,
+ #ifdef CONFIG_NET_MEDIATEK_SOC_WED
+ 		if (mtk_wed_device_active(&dev->mmio.wed) &&
+ 		    token >= dev->mmio.wed.wlan.token_start &&
++		    token < dev->mmio.wed.wlan.token_start +
++			    dev->mmio.wed.wlan.nbuf &&
+ 		    --dev->wed_token_count == 0)
+ 			wake_up(&dev->tx_wait);
+ #endif
