@@ -1,0 +1,147 @@
+From 3a92b2d8eb5c14097b1d9ea12728837434aa5aa4 Mon Sep 17 00:00:00 2001
+From: developer <developer@mediatek.com>
+Date: Fri, 29 Aug 2025 19:21:37 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: use XMAC-v2 counters
+
+Change XGMAC statistics method for ethtool.
+
+Without this patch, the XGMAC statistics shown by
+the ethtool command will not be as expected.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/3a92b2d8eb5c14097b1d9ea12728837434aa5aa4
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-eth-28-mtk_eth_soc-change-xgmac-counter-statistics.patch
+[plcharriere: select the XMAC-v2 counters by MTK_XGMAC_V2 and XGMII mode
+instead of a vendor-only MAC type field; check carrier only on that path;
+take a final sample under stats_lock in mtk_mac_link_down(), since phylink
+drops carrier before it and XGMAC-v2 link-up clears the counter block;
+name the counter offsets]
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 67 ++++++++++++++++++++-
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h | 12 ++++
+ 2 files changed, 76 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -768,6 +768,8 @@ static int mtk_mac_finish(struct phylink
+ 	return 0;
+ }
+ 
++static void mtk_stats_update_xmac_v2_link_down(struct mtk_mac *mac);
++
+ static void mtk_mac_link_down(struct phylink_config *config, unsigned int mode,
+ 			      phy_interface_t interface)
+ {
+@@ -787,12 +789,14 @@ static void mtk_mac_link_down(struct phy
+ 		/* XGMAC except for built-in switch */
+ 		mtk_m32(mac->hw, XMAC_MCR_TRX_DISABLE, XMAC_MCR_TRX_DISABLE,
+ 			MTK_XMAC_MCR(mac->id));
+-		if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
++		if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2)) {
++			mtk_stats_update_xmac_v2_link_down(mac);
+ 			mtk_m32(mac->hw, XMAC_FORCE_LINK, 0,
+ 				MTK_XMAC_STS_FRC(mac->id));
+-		else
++		} else {
+ 			mtk_m32(mac->hw, MTK_XGMAC_FORCE_LINK(mac->id), 0,
+ 				MTK_XGMAC_STS(mac->id));
++		}
+ 	}
+ }
+ 
+@@ -1244,6 +1248,63 @@ static int mtk_set_mac_address(struct ne
+ 	return 0;
+ }
+ 
++static bool mtk_stats_update_xmac_v2(struct mtk_mac *mac, bool link_down)
++{
++	struct mtk_hw_stats *hw_stats = mac->hw_stats;
++	struct mtk_eth *eth = mac->hw;
++	u32 rx_fcs_errors, rx_eof;
++
++	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2) ||
++	    !mtk_interface_mode_is_xgmii(eth, mac->interface) ||
++	    mac->id == MTK_GMAC1_ID)
++		return false;
++
++	if (!link_down && !netif_carrier_ok(eth->netdev[mac->id]))
++		return true;
++
++	rx_fcs_errors = FIELD_GET(XMAC_CNT_LOW_MASK,
++				  mtk_r32(eth, MTK_XMAC_RX_FCS_ERR_CNT(mac->id)));
++	rx_eof = FIELD_GET(XMAC_CNT_LOW_MASK,
++			   mtk_r32(eth, MTK_XMAC_RX_EOF_CNT(mac->id)));
++
++	/* MediaTek treats an excessive FCS count as an invalid RX snapshot. */
++	if (rx_fcs_errors <= rx_eof * 2) {
++		hw_stats->rx_packets +=
++			mtk_r32(eth, MTK_XMAC_RX_PKT_CNT(mac->id));
++		hw_stats->rx_bytes +=
++			mtk_r32(eth, MTK_XMAC_RX_BYTE_CNT(mac->id));
++		hw_stats->rx_fcs_errors += rx_fcs_errors;
++		hw_stats->rx_short_errors +=
++			mtk_r32(eth, MTK_XMAC_RX_SHORT_ERR_CNT(mac->id));
++		hw_stats->rx_long_errors +=
++			FIELD_GET(XMAC_CNT_LOW_MASK,
++				  mtk_r32(eth,
++					  MTK_XMAC_RX_LONG_ERR_CNT(mac->id)));
++		hw_stats->rx_flow_control_packets +=
++			FIELD_GET(XMAC_CNT_LOW_MASK,
++				  mtk_r32(eth, MTK_XMAC_RX_PAUSE_CNT(mac->id)));
++	}
++
++	hw_stats->tx_bytes += mtk_r32(eth, MTK_XMAC_TX_BYTE_CNT(mac->id));
++	hw_stats->tx_packets += mtk_r32(eth, MTK_XMAC_TX_PKT_CNT(mac->id));
++
++	mtk_m32(eth, XMAC_GLB_CNTCLR, XMAC_GLB_CNTCLR,
++		MTK_XMAC_CNT_CTRL(mac->id));
++
++	return true;
++}
++
++static void mtk_stats_update_xmac_v2_link_down(struct mtk_mac *mac)
++{
++	struct mtk_hw_stats *hw_stats = mac->hw_stats;
++
++	spin_lock_bh(&hw_stats->stats_lock);
++	u64_stats_update_begin(&hw_stats->syncp);
++	mtk_stats_update_xmac_v2(mac, true);
++	u64_stats_update_end(&hw_stats->syncp);
++	spin_unlock_bh(&hw_stats->stats_lock);
++}
++
+ void mtk_stats_update_mac(struct mtk_mac *mac)
+ {
+ 	struct mtk_hw_stats *hw_stats = mac->hw_stats;
+@@ -1258,7 +1319,7 @@ void mtk_stats_update_mac(struct mtk_mac
+ 		hw_stats->rx_bytes += mtk_r32(mac->hw, MT7628_SDM_RBCNT);
+ 		hw_stats->rx_checksum_errors +=
+ 			mtk_r32(mac->hw, MT7628_SDM_CS_ERR);
+-	} else {
++	} else if (!mtk_stats_update_xmac_v2(mac, false)) {
+ 		const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 		unsigned int offs = hw_stats->reg_offset;
+ 		u64 stats;
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -574,6 +574,18 @@
+ #define MTK_XMAC_CNT_CTRL(x)	(MTK_XMAC_BASE(x) + 0x100)
+ #define XMAC_GLB_CNTCLR		BIT(0)
+ 
++/* XFI Mac traffic counters */
++#define MTK_XMAC_TX_PKT_CNT(x)		(MTK_XMAC_BASE(x) + 0x114)
++#define MTK_XMAC_TX_BYTE_CNT(x)		(MTK_XMAC_BASE(x) + 0x134)
++#define MTK_XMAC_RX_PKT_CNT(x)		(MTK_XMAC_BASE(x) + 0x18c)
++#define MTK_XMAC_RX_PAUSE_CNT(x)	(MTK_XMAC_BASE(x) + 0x190)
++#define MTK_XMAC_RX_LONG_ERR_CNT(x)	(MTK_XMAC_BASE(x) + 0x194)
++#define MTK_XMAC_RX_FCS_ERR_CNT(x)	(MTK_XMAC_BASE(x) + 0x198)
++#define MTK_XMAC_RX_EOF_CNT(x)		(MTK_XMAC_BASE(x) + 0x1a4)
++#define MTK_XMAC_RX_BYTE_CNT(x)		(MTK_XMAC_BASE(x) + 0x1ac)
++#define MTK_XMAC_RX_SHORT_ERR_CNT(x)	(MTK_XMAC_BASE(x) + 0x1bc)
++#define XMAC_CNT_LOW_MASK		GENMASK(15, 0)
++
+ /* GPIO port control registers for GMAC 2*/
+ #define GPIO_OD33_CTRL8		0x4c0
+ #define GPIO_BIAS_CTRL		0xed0
