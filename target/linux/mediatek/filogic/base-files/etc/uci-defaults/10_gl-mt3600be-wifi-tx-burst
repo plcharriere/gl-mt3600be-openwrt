@@ -1,0 +1,26 @@
+. /lib/functions.sh
+
+[ "$(board_name)" = "glinet,gl-mt3600be" ] || exit 0
+
+tx_burst_changed=0
+
+set_5ghz_tx_burst() {
+	local section="$1"
+	local band burst
+
+	config_get band "$section" band
+	[ "$band" = "5g" ] || return
+
+	config_get burst "$section" tx_queue_data2_burst
+	[ -n "$burst" ] && return
+
+	uci set "wireless.${section}.tx_queue_data2_burst=4.0"
+	tx_burst_changed=1
+}
+
+config_load wireless
+config_foreach set_5ghz_tx_burst wifi-device
+
+[ "$tx_burst_changed" -eq 0 ] || uci commit wireless
+
+exit 0
