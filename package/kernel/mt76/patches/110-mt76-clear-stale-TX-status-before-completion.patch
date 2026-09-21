@@ -1,0 +1,80 @@
+From ce96aa2731d93425f4d9584a888ad42d41466a3e Mon Sep 17 00:00:00 2001
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Wed, 11 Mar 2026 14:20:44 +0800
+Subject: [PATCH] mtk: mt76: mt7996: clear ieee80211_tx_info->status before use
+
+Because the ieee80211_tx_info->status shares memory with other members
+that belong to the same union, it must be initialized before being used
+to prevent residual data from previous usage
+(e.g., ieee80211_tx_info->control is use in the TX path).
+
+However, mt76 uses ieee80211_tx_info->status->status_driver_data across
+the TX and TxS path, so the field cannot be cleared.
+
+Do the initialization in the following cases,
+1. In _mt76_tx_complete_skb(), if the cb->pktid < MT_PACKET_ID_FIRST,
+   the upper layer does not need the TxS, so we just clear the
+   ieee80211_tx_info->status to prevent the garbage data from being used.
+2. In __mt76_tx_status_skb_done(), if the skb's TxS and TxFree are both
+   ready, we clear the ieee80211_tx_info->status before using it.
+
+Do NOT do the initialization in the following case
+1. In mt76_tx_status_skb_get(), which calls __mt76_tx_status_skb_done()
+   with input flags MT_TX_CB_TXS_FAILED and MT_TX_CB_TXS_DONE being on.
+   The TxS of the skb is timed out and will not be sent to the upper layer.
+
+issue severity: High
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/4b573a7e757e53e638521be26d686084df058bf2
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+[plcharriere: clear the status only up to status_driver_data; for TX
+status reports, clear it in mt7996_mac_add_txs_skb() before it is filled
+instead of in __mt76_tx_status_skb_done()]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ tx.c         |  3 +++
+ mt76.h       | 10 ++++++++++
+ mt7996/mac.c |  1 +
+ 3 files changed, 14 insertions(+)
+
+--- a/tx.c
++++ b/tx.c
+@@ -305,6 +305,9 @@ void __mt76_tx_complete_skb(struct mt76_
+ 
+ 	if (cb->pktid < MT_PACKET_ID_FIRST) {
+ 		struct ieee80211_rate_status rs = {};
++		struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
++
++		mt76_tx_info_clear_status(info);
+ 
+ 		hw = mt76_tx_status_get_hw(dev, skb);
+ 		status.sta = wcid_to_sta(wcid);
+--- a/mt76.h
++++ b/mt76.h
+@@ -1476,6 +1476,16 @@ static inline struct mt76_tx_cb *mt76_tx
+ 	return ((void *)IEEE80211_SKB_CB(skb)->status.status_driver_data);
+ }
+ 
++/* clear the status left over from the TX control data, but not
++ * status_driver_data, which holds struct mt76_tx_cb
++ */
++static inline void mt76_tx_info_clear_status(struct ieee80211_tx_info *info)
++{
++	memset(&info->status, 0,
++	       offsetof(struct ieee80211_tx_info, status.status_driver_data) -
++	       offsetof(struct ieee80211_tx_info, status));
++}
++
+ static inline void *mt76_skb_get_hdr(struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status mstat;
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -1497,6 +1497,7 @@ mt7996_mac_add_txs_skb(struct mt7996_dev
+ 		skb = mt76_tx_status_skb_get(mdev, wcid, pid, &list);
+ 		if (skb) {
+ 			info = IEEE80211_SKB_CB(skb);
++			mt76_tx_info_clear_status(info);
+ 			if (!(txs & MT_TXS0_ACK_ERROR_MASK))
+ 				info->flags |= IEEE80211_TX_STAT_ACK;
+ 
