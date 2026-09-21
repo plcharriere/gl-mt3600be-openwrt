@@ -1,0 +1,75 @@
+From 970222d6ae0073e38289a691245a0f13392b8641 Mon Sep 17 00:00:00 2001
+From: "chak-kei.lam" <chak-kei.lam@mediatek.com>
+Date: Tue, 3 Feb 2026 10:59:49 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: fix mtk_eth_offload_init
+ memory leak
+
+Fix memory leak in mtk_eth_offload_init by correcting initialization sequence.
+This moves offload initialization outside the PPE loop to prevent multiple
+allocations, ensuring proper resource management.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-eth-43-mtk_eth_soc-fix-mtk_eth_offload_init-memory-leak.patch
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-ppe-33-net-ethernet-mtk_eth_soc-fix-mtk_eth_offload_init-memory-leak.patch
+[plcharriere: take the mtk_eth_offload_init() change from the
+mtk_ppe_offload.c part of the second patch; destroy the flow table on the
+probe error path instead of in mtk_ppe_deinit(), which is also reached when
+PPE creation fails before the table exists]
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c     | 10 ++++++----
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h     |  2 +-
+ drivers/net/ethernet/mediatek/mtk_ppe_offload.c |  4 +---
+ 3 files changed, 8 insertions(+), 8 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -5907,11 +5907,11 @@ static int mtk_probe(struct platform_dev
+ 				err = -ENOMEM;
+ 				goto err_deinit_ppe;
+ 			}
+-			err = mtk_eth_offload_init(eth, i);
+-
+-			if (err)
+-				goto err_deinit_ppe;
+ 		}
++
++		err = mtk_eth_offload_init(eth);
++		if (err)
++			goto err_deinit_ppe;
+ 	}
+ 
+ 	/* we run 2 devices on the same DMA ring so we need a dummy device
+@@ -5954,6 +5954,8 @@ static int mtk_probe(struct platform_dev
+ 
+ err_unreg_netdev:
+ 	mtk_unreg_dev(eth);
++	if (eth->soc->offload_version)
++		rhashtable_destroy(&eth->flow_table);
+ err_deinit_ppe:
+ 	/* A netdev opened while probe was still registering can have queued
+ 	 * the frame-engine reset worker, which takes rtnl and drives the
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1617,7 +1617,7 @@ int mtk_gmac_gephy_path_setup(struct mtk
+ int mtk_gmac_rgmii_path_setup(struct mtk_eth *eth, int mac_id);
+ int mtk_gmac_usxgmii_path_setup(struct mtk_eth *eth, int mac_id);
+ 
+-int mtk_eth_offload_init(struct mtk_eth *eth, u8 id);
++int mtk_eth_offload_init(struct mtk_eth *eth);
+ int mtk_eth_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 		     void *type_data);
+ void mtk_flow_offload_unbind_wcid(struct mtk_eth *eth, int wed_index, u16 wcid,
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -818,9 +818,7 @@ int mtk_eth_setup_tc(struct net_device *
+ 	}
+ }
+ 
+-int mtk_eth_offload_init(struct mtk_eth *eth, u8 id)
++int mtk_eth_offload_init(struct mtk_eth *eth)
+ {
+-	if (!eth->ppe[id] || !eth->ppe[id]->foe_table)
+-		return 0;
+ 	return rhashtable_init(&eth->flow_table, &mtk_flow_ht_params);
+ }
