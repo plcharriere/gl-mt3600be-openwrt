@@ -1,0 +1,245 @@
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Tue, 29 Apr 2025 22:15:57 +0800
+Subject: [PATCH 13/15] net: ethernet: mtk_wed: add WDMA disable flow to
+ WiFi L1 SER
+
+Without this patch, the WED driver cannot prevent packets from entering
+WDMA during WiFi L1 SER, causing incomplete packets to get stuck in the
+PSE. Then results in the PSE buffer management transitioning to a chaotic
+state.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-wed-13-net-ethernet-mtk_wed-add-WDMA-disable-flow-to-WiFi-L.patch
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/25.12/files/target/linux/mediatek/patches-6.12/999-wed-21-refactor-txbm-reset-flow.patch
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Co-developed-by: Rex Lu <rex.lu@mediatek.com>
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+[plcharriere: combine with Rex Lu's "refactor txbm reset flow", which says:
+"add realloc txbm buff pool after wed txbm reset. without this patch, tx
+performance may decrease due to tx buff pool exist wrong data after SER";
+add the WDMA port gate as mtk_wed_pse_wdma_enable() with an explicit upper
+MTK_FE_GLO_CFG() bank, as this tree lacks MediaTek's PSE-port register
+refactor; add fe_lock/mtk_fe_m32() and use them for the PPE link-down
+updates in mtk_prepare_for_reset() and mtk_pending_work() as well; allocate
+the new TX buffer pool before freeing the old one and keep the old pool on
+failure]
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -814,6 +814,29 @@ free_pagelist:
+ }
+ 
+ static int
++mtk_wed_replace_tx_buffer(struct mtk_wed_device *dev)
++{
++	typeof(dev->tx_buf_ring) old_ring = dev->tx_buf_ring;
++	typeof(dev->tx_buf_ring) new_ring;
++	int ret;
++
++	memset(&dev->tx_buf_ring, 0, sizeof(dev->tx_buf_ring));
++	ret = mtk_wed_tx_buffer_alloc(dev);
++	if (ret) {
++		mtk_wed_free_tx_buffer(dev);
++		dev->tx_buf_ring = old_ring;
++		return ret;
++	}
++
++	new_ring = dev->tx_buf_ring;
++	dev->tx_buf_ring = old_ring;
++	mtk_wed_free_tx_buffer(dev);
++	dev->tx_buf_ring = new_ring;
++
++	return 0;
++}
++
++static int
+ mtk_wed_hwrro_buffer_alloc(struct mtk_wed_device *dev)
+ {
+ 	int n_pages = MTK_WED_RX_PG_BM_CNT / MTK_WED_RX_BUF_PER_PAGE;
+@@ -2127,11 +2150,32 @@ mtk_wed_wpdma_tx_reset(struct mtk_wed_de
+ }
+ 
+ static void
++mtk_wed_pse_wdma_enable(struct mtk_wed_device *dev, bool enable)
++{
++	static const u8 pse_port[] = {
++		PSE_WDMA0_PORT,
++		PSE_WDMA1_PORT,
++		PSE_WDMA2_PORT,
++	};
++	struct mtk_eth *eth = dev->hw->eth;
++	u32 reg = MTK_FE_GLO_CFG(MTK_GMAC3_ID);
++	u32 mask;
++
++	if (WARN_ON(dev->wdma_idx >= ARRAY_SIZE(pse_port)))
++		return;
++
++	mask = MTK_FE_LINK_DOWN_P(pse_port[dev->wdma_idx]);
++	mtk_fe_m32(eth, mask, enable ? 0 : mask, reg);
++}
++
++static void
+ mtk_wed_reset_dma(struct mtk_wed_device *dev)
+ {
+ 	bool busy = false;
+ 	u32 val;
+-	int i;
++	int i, ret;
++
++	mtk_wed_pse_wdma_enable(dev, false);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(dev->tx_ring); i++) {
+ 		if (!dev->tx_ring[i].desc)
+@@ -2161,21 +2205,34 @@ mtk_wed_reset_dma(struct mtk_wed_device
+ 
+ 	/* 3. reset WED TX BM */
+ 	wed_clr(dev, MTK_WED_CTRL, MTK_WED_CTRL_WED_TX_FREE_AGENT_EN);
++	mtk_wed_poll_busy(dev, MTK_WED_CTRL,
++			  MTK_WED_CTRL_WED_TX_FREE_AGENT_BUSY);
+ 
+ 	for (i = 0; i < 100; i++) {
+-		if (mtk_wed_is_v1(dev->hw))
++		if (mtk_wed_is_v1(dev->hw)) {
+ 			val = FIELD_GET(MTK_WED_TX_BM_INTF_TKFIFO_FDEP,
+ 					wed_r32(dev, MTK_WED_TX_BM_INTF));
+-		else
++			if (val == 0x40)
++				break;
++		} else {
+ 			val = FIELD_GET(MTK_WED_TX_TKID_INTF_TKFIFO_FDEP,
+ 					wed_r32(dev, MTK_WED_TX_TKID_INTF));
+-		if (val == 0x40)
+-			break;
++			if (val == 0x200)
++				break;
++		}
+ 	}
+ 
+ 	mtk_wed_reset(dev, MTK_WED_RESET_TX_FREE_AGENT);
+ 	wed_clr(dev, MTK_WED_CTRL, MTK_WED_CTRL_WED_TX_BM_EN);
+ 	mtk_wed_reset(dev, MTK_WED_RESET_TX_BM);
++	mtk_wed_poll_busy(dev, MTK_WED_CTRL, MTK_WED_CTRL_WED_TX_BM_BUSY);
++
++	if (mtk_wed_is_v3_or_greater(dev->hw)) {
++		ret = mtk_wed_replace_tx_buffer(dev);
++		if (ret)
++			dev_warn(dev->hw->dev,
++				 "failed to replace TX buffer pool: %d\n", ret);
++	}
+ 
+ 	/* 4. reset WED WPDMA tx */
+ 	mtk_wed_wpdma_tx_reset(dev);
+@@ -2838,6 +2895,7 @@ mtk_wed_start(struct mtk_wed_device *dev
+ 	mtk_wed_amsdu_init(dev);
+ 
+ 	mtk_wed_dma_enable(dev);
++	mtk_wed_pse_wdma_enable(dev, true);
+ 	dev->running = true;
+ }
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -321,6 +321,15 @@ u32 mtk_m32(struct mtk_eth *eth, u32 mas
+ 	return reg;
+ }
+ 
++void mtk_fe_m32(struct mtk_eth *eth, u32 mask, u32 set, unsigned int reg)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&eth->fe_lock, flags);
++	mtk_m32(eth, mask, set, reg);
++	spin_unlock_irqrestore(&eth->fe_lock, flags);
++}
++
+ static int mtk_mdio_busy_wait(struct mtk_eth *eth)
+ {
+ 	u32 val;
+@@ -4890,19 +4899,19 @@ static int mtk_do_ioctl(struct net_devic
+ 
+ static void mtk_prepare_for_reset(struct mtk_eth *eth)
+ {
+-	u32 val;
++	u32 mask, val;
+ 	int i;
+ 
+ 	/* set FE PPE ports link down */
+ 	for (i = MTK_GMAC1_ID;
+ 	     i <= (mtk_is_netsys_v3_or_greater(eth) ? MTK_GMAC3_ID : MTK_GMAC2_ID);
+ 	     i += 2) {
+-		val = mtk_r32(eth, MTK_FE_GLO_CFG(i)) | MTK_FE_LINK_DOWN_P(PSE_PPE0_PORT);
++		mask = MTK_FE_LINK_DOWN_P(PSE_PPE0_PORT);
+ 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSTCTRL_PPE1))
+-			val |= MTK_FE_LINK_DOWN_P(PSE_PPE1_PORT);
++			mask |= MTK_FE_LINK_DOWN_P(PSE_PPE1_PORT);
+ 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSTCTRL_PPE2))
+-			val |= MTK_FE_LINK_DOWN_P(PSE_PPE2_PORT);
+-		mtk_w32(eth, val, MTK_FE_GLO_CFG(i));
++			mask |= MTK_FE_LINK_DOWN_P(PSE_PPE2_PORT);
++		mtk_fe_m32(eth, mask, mask, MTK_FE_GLO_CFG(i));
+ 	}
+ 
+ 	/* adjust PPE configurations to prepare for reset */
+@@ -4923,7 +4932,7 @@ static void mtk_pending_work(struct work
+ {
+ 	struct mtk_eth *eth = container_of(work, struct mtk_eth, pending_work);
+ 	unsigned long restart = 0;
+-	u32 val;
++	u32 mask;
+ 	int i;
+ 
+ 	rtnl_lock();
+@@ -4970,13 +4979,13 @@ static void mtk_pending_work(struct work
+ 	for (i = MTK_GMAC1_ID;
+ 	     i <= (mtk_is_netsys_v3_or_greater(eth) ? MTK_GMAC3_ID : MTK_GMAC2_ID);
+ 	     i += 2) {
+-		val = mtk_r32(eth, MTK_FE_GLO_CFG(i)) & ~MTK_FE_LINK_DOWN_P(PSE_PPE0_PORT);
++		mask = MTK_FE_LINK_DOWN_P(PSE_PPE0_PORT);
+ 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSTCTRL_PPE1))
+-			val &= ~MTK_FE_LINK_DOWN_P(PSE_PPE1_PORT);
++			mask |= MTK_FE_LINK_DOWN_P(PSE_PPE1_PORT);
+ 		if (MTK_HAS_CAPS(eth->soc->caps, MTK_RSTCTRL_PPE2))
+-			val &= ~MTK_FE_LINK_DOWN_P(PSE_PPE2_PORT);
++			mask |= MTK_FE_LINK_DOWN_P(PSE_PPE2_PORT);
+ 
+-		mtk_w32(eth, val, MTK_FE_GLO_CFG(i));
++		mtk_fe_m32(eth, mask, 0, MTK_FE_GLO_CFG(i));
+ 	}
+ 
+ 	clear_bit(MTK_RESETTING, &eth->state);
+@@ -5798,6 +5807,7 @@ static int mtk_probe(struct platform_dev
+ 	}
+ 
+ 	spin_lock_init(&eth->page_lock);
++	spin_lock_init(&eth->fe_lock);
+ 	spin_lock_init(&eth->tx_irq_lock);
+ 	spin_lock_init(&eth->rx_irq_lock);
+ 	spin_lock_init(&eth->dim_lock);
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1348,6 +1348,7 @@ struct mtk_soc_data {
+  * @base:		The mapped register i/o base
+  * @sram_pool:		Pointer to SRAM pool used for DMA descriptor rings
+  * @page_lock:		Make sure that register operations are atomic
++ * @fe_lock:		Serialize shared FE global register updates
+  * @tx_irq__lock:	Make sure that IRQ register operations are atomic
+  * @rx_irq__lock:	Make sure that IRQ register operations are atomic
+  * @dim_lock:		Make sure that Net DIM operations are atomic
+@@ -1394,6 +1395,7 @@ struct mtk_eth {
+ 	void __iomem			*base;
+ 	struct gen_pool			*sram_pool;
+ 	spinlock_t			page_lock;
++	spinlock_t			fe_lock; /* protects shared FE registers */
+ 	spinlock_t			tx_irq_lock;
+ 	spinlock_t			rx_irq_lock;
+ 	struct net_device		*dummy_dev;
+@@ -1623,6 +1625,7 @@ void mtk_stats_update_mac(struct mtk_mac
+ void mtk_w32(struct mtk_eth *eth, u32 val, unsigned reg);
+ u32 mtk_r32(struct mtk_eth *eth, unsigned reg);
+ u32 mtk_m32(struct mtk_eth *eth, u32 mask, u32 set, unsigned int reg);
++void mtk_fe_m32(struct mtk_eth *eth, u32 mask, u32 set, unsigned int reg);
+ 
+ int mtk_gmac_sgmii_path_setup(struct mtk_eth *eth, int mac_id);
+ int mtk_gmac_2p5gphy_path_setup(struct mtk_eth *eth, int mac_id);

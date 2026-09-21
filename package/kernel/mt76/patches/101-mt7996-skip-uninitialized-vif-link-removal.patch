@@ -1,0 +1,53 @@
+From adfba73fce964122706f12f8ef6674263f68b04c Mon Sep 17 00:00:00 2001
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Tue, 21 Jul 2026 18:59:45 +0800
+Subject: [PATCH] mtk: mt76: mt7996: check if link BSS is initialized before
+ dofing vif_link_remove
+
+Problem:
+Crash happens on switching an interface to MLD and then to legacy.
+
+Root Cause:
+A crash issue could occur with the following command sequence:
+
+change_vif_links: old=0x0, new=0x1
+change_vif_links: old=0x1, new=0x0
+
+Since mvif->link[0] always points to vif->drv_priv, if the above command
+sequence occurs, mt7996_vif_link_remove() will be called again without
+a previous mt7996_vif_link_add().
+
+Solution:
+Add a check to ensure mlink->wcid is not NULL before proceeding with
+vif link removal operations.
+
+Feature:
+Stability
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/commit/c6b206f391358af2fee96389544162838505fd1f
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+[plcharriere: rebase onto upstream mt7996_vif_link_remove(): return before
+the mlink->wcid dereference and set link_id after the check]
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/main.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -469,8 +469,13 @@ void mt7996_vif_link_remove(struct mt76_
+ 	struct mt7996_vif_link *link = container_of(mlink, struct mt7996_vif_link, mt76);
+ 	struct mt7996_vif *mvif = (struct mt7996_vif *)vif->drv_priv;
+ 	struct mt7996_sta_link *msta_link = &link->msta_link;
+-	unsigned int link_id = msta_link->wcid.link_id;
+ 	struct mt7996_phy *phy = mphy->priv;
++	unsigned int link_id;
++
++	if (!mlink->wcid)
++		return;
++
++	link_id = msta_link->wcid.link_id;
+ 
+ 	/* Hw requires to destroy active links tearing down the interface, so
+ 	 * postpone it removing the interface.

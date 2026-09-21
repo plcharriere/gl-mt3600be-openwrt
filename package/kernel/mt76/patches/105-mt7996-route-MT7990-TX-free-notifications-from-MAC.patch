@@ -1,0 +1,36 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 19 Sep 2026 15:00:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: route MT7990 TX-free notifications from MAC
+
+MT7990 does not have WA firmware and exposes dedicated MAC TX-free rings.
+However, mt7996_mac_init() currently groups it with MT7992 and programs
+UNI_RRO_SET_TXFREE_PATH to 1, selecting the WA path.  That disagrees with
+the dedicated MAC ring configured for MT7990 and prevents the expected
+TX-free notifications from reaching it.
+
+MediaTek's MT7990 implementation defines path 0 as MAC and path 1 as WA,
+and selects the MAC path for MT7990.  Select the WA path only for MT7992;
+MT7996 and MT7990 continue through the MAC path.  This preserves the
+existing behaviour for MT7996 and MT7992 while correcting MT7990.
+
+The reference behavior comes from MediaTek's current MT7990 token and WED
+implementation; this patch is the narrow adaptation for upstream mt76.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/671c2416d6219beb19abbb05709e418a6363be62/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0054-mtk-mt76-add-debug-tools.patch
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/init.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -656,7 +656,7 @@ void mt7996_mac_init(struct mt7996_dev *
+ 		mt7996_mcu_set_rro(dev, UNI_RRO_SET_BYPASS_MODE,
+ 				   is_mt7996(&dev->mt76) ? 1 : 2);
+ 		mt7996_mcu_set_rro(dev, UNI_RRO_SET_TXFREE_PATH,
+-				   !is_mt7996(&dev->mt76));
++				   is_mt7992(&dev->mt76));
+ 	} else {
+ 		mt7996_mcu_set_rro(dev, UNI_RRO_SET_BYPASS_MODE, 3);
+ 		mt7996_mcu_set_rro(dev, UNI_RRO_SET_TXFREE_PATH, 1);
