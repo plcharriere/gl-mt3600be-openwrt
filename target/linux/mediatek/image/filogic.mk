@@ -2036,7 +2036,7 @@ define Device/glinet_gl-mt3600be
   DEVICE_DTS := mt7987a-glinet-gl-mt3600be
   DEVICE_DTS_DIR := ../dts
   DEVICE_PACKAGES := mt7987-2p5g-phy-firmware kmod-mt7990-firmware \
-	kmod-hwmon-pwmfan kmod-usb3 mt7996-wed-enable
+	kmod-hwmon-pwmfan kmod-usb3 mt7996-wed-enable libiwinfo
   KERNEL_IN_UBI := 1
   KERNEL_LOADADDR := 0x40000000
   UBINIZE_OPTS := -E 5
