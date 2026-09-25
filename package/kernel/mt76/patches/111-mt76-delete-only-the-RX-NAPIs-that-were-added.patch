@@ -1,0 +1,48 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 26 Sep 2026 00:38:34 +0900
+Subject: [PATCH] wifi: mt76: delete only the RX NAPIs that were added
+
+mt76_dma_init() does not add the NAPI of a WED RRO queue, and
+mt7996_dma_rro_start() adds it only when WED is not active, but
+mt76_dma_cleanup() calls netif_napi_del() for every RX queue. With WED
+active, netif_napi_del() then locks the NULL device of a NAPI that was
+never added, and mt7996e module removal panics.
+
+Nicolas Cavallari's upstream fix skipped the deletion by the WED RRO
+queue role, and also disabled every RX NAPI in the shared cleanup path.
+It was reverted because mt7921 and mt7925 already disable their NAPIs,
+and a second napi_disable() hangs.
+
+Use NAPI_STATE_LISTED, which netif_napi_del() itself tests, to delete
+only the NAPIs that were added. Walk the whole NAPI array, as
+mt7996_unregister_device() does to disable them, rather than the queues
+with descriptors. This also handles a mt7996 without WED, where the RRO
+queues have their NAPIs added.
+
+Fixes: 7dd72bbd6f51 ("wifi: mt76: Fix memory leak destroying device")
+Link: https://github.com/openwrt/mt76/commit/332bbe9b2784bea2fd2b00fceb8eacf0fba06728
+Link: https://github.com/openwrt/mt76/commit/6d1c6a758a4c0a690ee56cb849387dfa262fdb17
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ dma.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/dma.c
++++ b/dma.c
+@@ -1215,10 +1215,14 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
+ 		mt76_dma_tx_cleanup(dev, dev->q_mcu[i], true);
+ 
++	for (i = 0; i < ARRAY_SIZE(dev->napi); i++) {
++		if (test_bit(NAPI_STATE_LISTED, &dev->napi[i].state))
++			netif_napi_del(&dev->napi[i]);
++	}
++
+ 	mt76_for_each_q_rx(dev, i) {
+ 		struct mt76_queue *q = &dev->q_rx[i];
+ 
+-		netif_napi_del(&dev->napi[i]);
+ 		mt76_dma_rx_cleanup(dev, q);
+ 
+ 		page_pool_destroy(q->page_pool);
