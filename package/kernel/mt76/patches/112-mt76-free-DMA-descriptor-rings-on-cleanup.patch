@@ -1,0 +1,85 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 26 Sep 2026 18:28:56 +0900
+Subject: [PATCH] wifi: mt76: free DMA descriptor rings on cleanup
+
+mt76_dma_alloc_queue() allocates each descriptor ring with
+dmam_alloc_coherent() on dev->dma_dev, and mt76_dma_cleanup() relies on
+device-managed release to free it.  With WED or NPU offload, dma_dev is
+the offload device instead of the device being unbound.  The WED platform
+device stays bound when mt7996e is removed, so every unbind leaks all
+descriptor rings.
+
+Record each queue's descriptor size, and free the rings explicitly in
+mt76_dma_cleanup() after the WED devices have been detached.  Queue
+pointers that share a queue free it only once.
+
+Fixes: e0bc736d5617 ("mt76: add support for overriding the device used for DMA mapping")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+--- a/dma.c
++++ b/dma.c
+@@ -851,6 +851,7 @@ mt76_dma_alloc_queue(struct mt76_dev *de
+ 	else
+ 		size = sizeof(struct mt76_desc);
+ 
++	q->desc_size = size;
+ 	q->desc = dmam_alloc_coherent(dev->dma_dev, q->ndesc * size,
+ 				      &q->desc_dma, GFP_KERNEL);
+ 	if (!q->desc)
+@@ -1193,6 +1194,17 @@ void mt76_dma_attach(struct mt76_dev *de
+ }
+ EXPORT_SYMBOL_GPL(mt76_dma_attach);
+ 
++static void
++mt76_dma_free_desc(struct mt76_dev *dev, struct mt76_queue *q)
++{
++	if (!q || !q->desc)
++		return;
++
++	dmam_free_coherent(dev->dma_dev, q->ndesc * q->desc_size, q->desc,
++			   q->desc_dma);
++	q->desc = NULL;
++}
++
+ void mt76_dma_cleanup(struct mt76_dev *dev)
+ {
+ 	int i;
+@@ -1234,6 +1246,28 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	if (mtk_wed_device_active(&dev->mmio.wed_hif2))
+ 		mtk_wed_device_detach(&dev->mmio.wed_hif2);
+ 
++	/* The descriptor rings are managed by dma_dev.  With WED or NPU
++	 * offload that is not the device being unbound, so the rings would
++	 * otherwise leak on every driver unbind.  Several queue pointers can
++	 * refer to the same queue, which is freed only once.
++	 */
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		struct mt76_phy *phy = dev->phys[i];
++		int j;
++
++		if (!phy)
++			continue;
++
++		for (j = 0; j < ARRAY_SIZE(phy->q_tx); j++)
++			mt76_dma_free_desc(dev, phy->q_tx[j]);
++	}
++
++	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
++		mt76_dma_free_desc(dev, dev->q_mcu[i]);
++
++	for (i = 0; i < ARRAY_SIZE(dev->q_rx); i++)
++		mt76_dma_free_desc(dev, &dev->q_rx[i]);
++
+ 	mt76_free_pending_txwi(dev);
+ 	mt76_free_pending_rxwi(dev);
+ 	free_netdev(dev->napi_dev);
+--- a/mt76.h
++++ b/mt76.h
+@@ -269,6 +269,7 @@ struct mt76_queue {
+ 	u8 buf_offset;
+ 	u16 flags;
+ 	u8 magic_cnt;
++	u8 desc_size;
+ 
+ 	__le16 *emi_cpu_idx;
+ 
