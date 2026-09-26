@@ -1,0 +1,84 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 26 Sep 2026 18:30:06 +0900
+Subject: [PATCH] net: ethernet: mtk_wed: fix A-MSDU buffer leaks
+
+mtk_wed_amsdu_buffer_alloc() allocates the A-MSDU descriptor array with
+devm_kcalloc() on the WED device every time a WLAN device attaches.  The
+WED platform device is not unbound when the WLAN driver detaches, so each
+attach leaks one array.  mtk_wed_amsdu_free_buffer() also leaves
+hw->wed_amsdu pointing at the buffers it has just freed.  If a later
+attach fails before the buffers are allocated again, the detach path frees
+those pages a second time.  The allocation error path unmaps the buffers
+but never frees their pages.
+
+Allocate the array with kcalloc().  On detach, free it together with the
+buffers and clear hw->wed_amsdu.  On the error path, release every page.
+
+Fixes: b230812b9dda ("net: ethernet: mtk_wed: introduce partial AMSDU offload support for MT7988")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -563,12 +563,13 @@ mtk_wed_amsdu_buffer_alloc(struct mtk_we
+ 	if (!mtk_wed_is_v3_or_greater(hw))
+ 		return 0;
+ 
+-	wed_amsdu = devm_kcalloc(hw->dev, MTK_WED_AMSDU_NPAGES,
+-				 sizeof(*wed_amsdu), GFP_KERNEL);
++	wed_amsdu = kcalloc(MTK_WED_AMSDU_NPAGES, sizeof(*wed_amsdu),
++			    GFP_KERNEL);
+ 	if (!wed_amsdu)
+ 		return -ENOMEM;
+ 
+ 	for (i = 0; i < MTK_WED_AMSDU_NPAGES; i++) {
++		dma_addr_t addr;
+ 		void *ptr;
+ 
+ 		/* each segment is 64K */
+@@ -579,21 +580,30 @@ mtk_wed_amsdu_buffer_alloc(struct mtk_we
+ 		if (!ptr)
+ 			goto error;
+ 
+-		wed_amsdu[i].txd = ptr;
+-		wed_amsdu[i].txd_phy = dma_map_single(hw->dev, ptr,
+-						      MTK_WED_AMSDU_BUF_SIZE,
+-						      DMA_TO_DEVICE);
+-		if (dma_mapping_error(hw->dev, wed_amsdu[i].txd_phy))
++		addr = dma_map_single(hw->dev, ptr, MTK_WED_AMSDU_BUF_SIZE,
++				      DMA_TO_DEVICE);
++		if (dma_mapping_error(hw->dev, addr)) {
++			free_pages((unsigned long)ptr,
++				   get_order(MTK_WED_AMSDU_BUF_SIZE));
+ 			goto error;
++		}
++
++		wed_amsdu[i].txd = ptr;
++		wed_amsdu[i].txd_phy = addr;
+ 	}
+ 	dev->hw->wed_amsdu = wed_amsdu;
+ 
+ 	return 0;
+ 
+ error:
+-	for (i--; i >= 0; i--)
++	while (--i >= 0) {
+ 		dma_unmap_single(hw->dev, wed_amsdu[i].txd_phy,
+ 				 MTK_WED_AMSDU_BUF_SIZE, DMA_TO_DEVICE);
++		free_pages((unsigned long)wed_amsdu[i].txd,
++			   get_order(MTK_WED_AMSDU_BUF_SIZE));
++	}
++	kfree(wed_amsdu);
++
+ 	return -ENOMEM;
+ }
+ 
+@@ -612,6 +622,8 @@ mtk_wed_amsdu_free_buffer(struct mtk_wed
+ 		free_pages((unsigned long)wed_amsdu[i].txd,
+ 			   get_order(MTK_WED_AMSDU_BUF_SIZE));
+ 	}
++	kfree(wed_amsdu);
++	dev->hw->wed_amsdu = NULL;
+ }
+ 
+ static int
