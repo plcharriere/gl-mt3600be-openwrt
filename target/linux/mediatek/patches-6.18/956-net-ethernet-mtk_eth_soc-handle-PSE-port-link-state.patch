@@ -1,0 +1,152 @@
+From 9453a58b1495ae7133181615dfad1a4f9581925a Mon Sep 17 00:00:00 2001
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Fri, 8 May 2026 11:20:00 +0800
+Subject: [PATCH] net: ethernet: mtk_eth_soc: add PSE port link handling for
+ MAC ports
+
+This patch prevents the PSE from forwarding traffic to MAC ports that
+are being stopped. As a result, it allows the XGMAC to drain any
+remaining packets from its FIFO and PSE_OQ before disabling XGMAC.
+
+Without this patch, users might observe traffic stuck in the PSE_OQ of
+a MAC port if the port is under full traffic load and the PHY link goes
+down suddenly.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/25.12/files/target/linux/mediatek/patches-6.12/999-eth-48-mtk_eth_soc-add-PSE-port-link-handling-for-MAC-ports.patch
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+[plcharriere: restrict it to MTK_XGMAC_V2, which identifies MT7987 in
+this driver; keep the MAC-indexed MTK_FE_GLO_CFG() bank selection, as this
+tree lacks MediaTek's PSE-port register refactor, and update the shared
+register with mtk_fe_m32(); poll the GDM2 and GDM3 state machines for
+GMAC2 and GMAC3, where the 6.12 macro used CDM2 and CDM3; skip the drain
+while NETSYS recovery already forces the path down; close the MAC ports
+after cold and warm hardware initialisation, which opens them, and let
+phylink reopen the ports whose link comes up]
+Assisted-by: Codex:gpt-5.6-sol
+Co-developed-by: Paul-Louis Charrière <plcharriere@gmail.com>
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -562,6 +562,71 @@ static bool mtk_check_gmac23_idle(struct
+ 	return false;
+ }
+ 
++static const u32 mtk_mac_gdm_fsm[MTK_GMAC_ID_MAX] = {
++	[MTK_GMAC1_ID] = MTK_FE_GDM1_FSM,
++	[MTK_GMAC2_ID] = MTK_FE_GDM2_FSM,
++	[MTK_GMAC3_ID] = MTK_FE_GDM3_FSM,
++};
++
++static const u8 mtk_mac_pse_port[MTK_GMAC_ID_MAX] = {
++	[MTK_GMAC1_ID] = PSE_GDM1_PORT,
++	[MTK_GMAC2_ID] = PSE_GDM2_PORT,
++	[MTK_GMAC3_ID] = PSE_GDM3_PORT,
++};
++
++static void mtk_pse_gdm_enable(struct mtk_mac *mac, bool enable)
++{
++	u32 port = mtk_mac_pse_port[mac->id];
++	u32 mask = MTK_FE_LINK_DOWN_P(port);
++
++	mtk_fe_m32(mac->hw, mask, enable ? 0 : mask,
++		   MTK_FE_GLO_CFG(mac->id));
++}
++
++static void mtk_pse_gdm_disable_all(struct mtk_eth *eth)
++{
++	int i;
++
++	if (!MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
++		return;
++
++	for (i = 0; i < MTK_MAX_DEVS; i++)
++		if (eth->mac[i])
++			mtk_pse_gdm_enable(eth->mac[i], false);
++}
++
++static int mtk_poll_mac123_idle(struct mtk_mac *mac)
++{
++	unsigned long timeout = jiffies + msecs_to_jiffies(1000);
++	struct mtk_eth *eth = mac->hw;
++	u32 gdm_fsm, gdm_idle;
++	u32 mac_fsm, mac_idle;
++
++	do {
++		gdm_fsm = mtk_r32(eth, mtk_mac_gdm_fsm[mac->id]);
++		mac_fsm = mtk_r32(eth, MTK_MAC_FSM(mac->id));
++
++		if (mtk_interface_mode_is_xgmii(eth, mac->interface)) {
++			gdm_idle = ((gdm_fsm & 0x00ffffff) == 0);
++			mac_idle = 1;
++		} else {
++			gdm_idle = (gdm_fsm == 0);
++			mac_idle = (mac_fsm == 0x01010000 ||
++				    mac_fsm == 0x01010100);
++		}
++
++		if (gdm_idle && mac_idle)
++			return 0;
++
++		usleep_range(10000, 20000);
++	} while (time_before(jiffies, timeout));
++
++	dev_warn(eth->dev,
++		 "timeout waiting for GDM and MAC to become idle: GDM_FSM=0x%08x, MAC_FSM=0x%08x\n",
++		 gdm_fsm, mac_fsm);
++	return -ETIMEDOUT;
++}
++
+ static int mtk_mac_prepare(struct phylink_config *config, unsigned int mode,
+ 			   phy_interface_t iface)
+ {
+@@ -808,6 +873,12 @@ static void mtk_mac_link_down(struct phy
+ 					   phylink_config);
+ 	struct mtk_eth *eth = mac->hw;
+ 
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2)) {
++		if (!test_bit(MTK_RESETTING, &eth->state))
++			mtk_poll_mac123_idle(mac);
++		mtk_pse_gdm_enable(mac, false);
++	}
++
+ 	if (!mtk_interface_mode_is_xgmii(mac->hw, interface)) {
+ 		/* GMAC modes */
+ 		mtk_m32(mac->hw,
+@@ -1022,6 +1093,7 @@ static void mtk_mac_link_up(struct phyli
+ {
+ 	struct mtk_mac *mac = container_of(config, struct mtk_mac,
+ 					   phylink_config);
++	struct mtk_eth *eth = mac->hw;
+ 
+ 	if (mtk_interface_mode_is_xgmii(mac->hw, interface))
+ 		mtk_xgdm_mac_link_up(mac, phy, mode, interface, speed, duplex,
+@@ -1029,6 +1101,9 @@ static void mtk_mac_link_up(struct phyli
+ 	else
+ 		mtk_gdm_mac_link_up(mac, phy, mode, interface, speed, duplex,
+ 				    tx_pause, rx_pause);
++
++	if (MTK_HAS_CAPS(eth->soc->caps, MTK_XGMAC_V2))
++		mtk_pse_gdm_enable(mac, true);
+ }
+ 
+ static void mtk_mac_disable_tx_lpi(struct phylink_config *config)
+@@ -4963,6 +5038,8 @@ static void mtk_pending_work(struct work
+ 				     eth->dev->pins->default_state);
+ 	mtk_hw_init(eth, true);
+ 
++	mtk_pse_gdm_disable_all(eth);
++
+ 	/* restart DMA and enable IRQs */
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+ 		if (!eth->netdev[i] || !test_bit(i, &restart))
+@@ -5957,6 +6034,9 @@ static int mtk_probe(struct platform_dev
+ 		}
+ 	}
+ 
++	/* Hardware initialization leaves every PSE MAC-port gate open. */
++	mtk_pse_gdm_disable_all(eth);
++
+ 	/* check if all MAC address providers are available and return
+ 	 * -EPROBE_DEFER in case at least one of them is not ready
+ 	 */
