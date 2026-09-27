@@ -1,0 +1,118 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:09:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: update SYSCFG0 bits atomically
+
+ETHSYS_SYSCFG0 is shared by every MAC, and phylink configures the MACs
+concurrently.  Updating one MAC's GE_MODE field or SGMII selection bit by
+reading the whole register and writing it back can restore stale bits
+that another MAC changed in between.
+
+Update the GE_MODE field with regmap_update_bits(), and let the path
+helpers that select SGMII or USXGMII for GMAC1-3 set or clear only their
+own MAC's bit, so each change is one locked read/modify/write of the bits
+it owns.  The resulting register values are unchanged.
+
+Assisted-by: Codex:gpt-5.6-sol
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -696,10 +696,9 @@ static void mtk_mac_config(struct phylin
+ 		}
+ 
+ 		/* put the gmac into the right mode */
+-		regmap_read(eth->ethsys, ETHSYS_SYSCFG0, &val);
+-		val &= ~SYSCFG0_GE_MODE(SYSCFG0_GE_MASK, mac->id);
+-		val |= SYSCFG0_GE_MODE(ge_mode, mac->id);
+-		regmap_write(eth->ethsys, ETHSYS_SYSCFG0, val);
++		regmap_update_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				   SYSCFG0_GE_MODE(SYSCFG0_GE_MASK, mac->id),
++				   SYSCFG0_GE_MODE(ge_mode, mac->id));
+ 	}
+ 
+ 	/* SGMII */
+--- a/drivers/net/ethernet/mediatek/mtk_eth_path.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_path.c
+@@ -201,24 +201,21 @@ static int set_mux_gmac1_gmac2_to_sgmii_
+ 
+ static int set_mux_gmac123_to_usxgmii(struct mtk_eth *eth, u64 path)
+ {
+-	unsigned int val = 0;
++	unsigned int sgmii = 0;
+ 	bool updated = true;
+ 	int mac_id = 0;
+ 
+-	/* Disable SYSCFG1 SGMII */
+-	regmap_read(eth->ethsys, ETHSYS_SYSCFG0, &val);
+-
+ 	switch (path) {
+ 	case MTK_ETH_PATH_GMAC1_USXGMII:
+-		val &= ~(u32)SYSCFG0_SGMII_GMAC1_V2;
++		sgmii = SYSCFG0_SGMII_GMAC1_V2;
+ 		mac_id = MTK_GMAC1_ID;
+ 		break;
+ 	case MTK_ETH_PATH_GMAC2_USXGMII:
+-		val &= ~(u32)SYSCFG0_SGMII_GMAC2_V2;
++		sgmii = SYSCFG0_SGMII_GMAC2_V2;
+ 		mac_id = MTK_GMAC2_ID;
+ 		break;
+ 	case MTK_ETH_PATH_GMAC3_USXGMII:
+-		val &= ~(u32)SYSCFG0_SGMII_GMAC3_V2;
++		sgmii = SYSCFG0_SGMII_GMAC3_V2;
+ 		mac_id = MTK_GMAC3_ID;
+ 		break;
+ 	default:
+@@ -226,8 +223,8 @@ static int set_mux_gmac123_to_usxgmii(st
+ 	};
+ 
+ 	if (updated) {
+-		regmap_update_bits(eth->ethsys, ETHSYS_SYSCFG0,
+-				   SYSCFG0_SGMII_MASK, val);
++		/* Disable SYSCFG0 SGMII of this MAC only */
++		regmap_clear_bits(eth->ethsys, ETHSYS_SYSCFG0, sgmii);
+ 
+ 		if (mac_id == MTK_GMAC2_ID)
+ 			regmap_set_bits(eth->infra, TOP_MISC_NETSYS_PCS_MUX,
+@@ -242,32 +239,30 @@ static int set_mux_gmac123_to_usxgmii(st
+ 
+ static int set_mux_gmac123_to_gephy_sgmii(struct mtk_eth *eth, u64 path)
+ {
+-	unsigned int val = 0;
+ 	bool updated = true;
+ 
+-	regmap_read(eth->ethsys, ETHSYS_SYSCFG0, &val);
+-
++	/* Change only this MAC's bit: other MACs are configured concurrently */
+ 	switch (path) {
+ 	case MTK_ETH_PATH_GMAC1_SGMII:
+-		val |= SYSCFG0_SGMII_GMAC1_V2;
++		regmap_set_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				SYSCFG0_SGMII_GMAC1_V2);
+ 		break;
+ 	case MTK_ETH_PATH_GMAC2_GEPHY:
+-		val &= ~(u32)SYSCFG0_SGMII_GMAC2_V2;
++		regmap_clear_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				  SYSCFG0_SGMII_GMAC2_V2);
+ 		break;
+ 	case MTK_ETH_PATH_GMAC2_SGMII:
+-		val |= SYSCFG0_SGMII_GMAC2_V2;
++		regmap_set_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				SYSCFG0_SGMII_GMAC2_V2);
+ 		break;
+ 	case MTK_ETH_PATH_GMAC3_SGMII:
+-		val |= SYSCFG0_SGMII_GMAC3_V2;
++		regmap_set_bits(eth->ethsys, ETHSYS_SYSCFG0,
++				SYSCFG0_SGMII_GMAC3_V2);
+ 		break;
+ 	default:
+ 		updated = false;
+ 	}
+ 
+-	if (updated)
+-		regmap_update_bits(eth->ethsys, ETHSYS_SYSCFG0,
+-				   SYSCFG0_SGMII_MASK, val);
+-
+ 	dev_dbg(eth->dev, "path %s in %s updated = %d\n",
+ 		mtk_eth_path_name(path), __func__, updated);
+ 
