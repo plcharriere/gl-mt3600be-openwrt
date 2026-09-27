@@ -1,0 +1,94 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sun, 27 Sep 2026 13:32:00 +0900
+Subject: [PATCH] net: ethernet: mtk_ppe: remove debugfs on deinit
+
+The PPE debugfs files keep a private pointer to struct mtk_ppe.  The PPE
+objects are device-managed, but their top-level debugfs directories are
+not.  After an Ethernet driver remove/reprobe cycle, reading a stale file
+therefore dereferences the released PPE object and can panic the kernel.
+
+Keep the directory dentry in struct mtk_ppe and remove it before destroying
+the PPE hash table.  Continue across empty PPE slots so every initialized
+PPE is released.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_ppe.c         |  3 ++-
+ drivers/net/ethernet/mediatek/mtk_ppe.h         |  4 ++++
+ drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c | 23 ++++++++++++++++++-----
+ 3 files changed, 24 insertions(+), 6 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -1276,7 +1276,8 @@ void mtk_ppe_deinit(struct mtk_eth *eth)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->ppe); i++) {
+ 		if (!eth->ppe[i])
+-			return;
++			continue;
++		mtk_ppe_debugfs_deinit(eth->ppe[i]);
+ 		rhashtable_destroy(&eth->ppe[i]->l2_flows);
+ 	}
+ }
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -19,6 +19,8 @@ struct mtk_flow_match {
+ 	void *arg;
+ };
+ 
++struct dentry;
++
+ #define MTK_PPE_ENTRIES_SHIFT		4
+ #define MTK_PPE_ENTRIES			(1024 << MTK_PPE_ENTRIES_SHIFT)
+ #define MTK_PPE_HASH_MASK		(MTK_PPE_ENTRIES - 1)
+@@ -346,6 +348,7 @@ struct mtk_ppe {
+ 	void __iomem *base;
+ 	int version;
+ 	char dirname[5];
++	struct dentry *debugfs_dir;
+ 	bool accounting;
+ 
+ 	void *foe_table;
+@@ -426,6 +429,7 @@ void mtk_foe_entry_unbind(struct mtk_ppe
+ int mtk_foe_entry_flow_idle(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			    bool rx, const struct mtk_flow_match *match);
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index);
++void mtk_ppe_debugfs_deinit(struct mtk_ppe *ppe);
+ void mtk_foe_entry_get_stats(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			     int *idle);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -183,13 +183,26 @@ DEFINE_SHOW_ATTRIBUTE(mtk_ppe_debugfs_fo
+ 
+ int mtk_ppe_debugfs_init(struct mtk_ppe *ppe, int index)
+ {
+-	struct dentry *root;
+-
+ 	snprintf(ppe->dirname, sizeof(ppe->dirname), "ppe%d", index);
+ 
+-	root = debugfs_create_dir(ppe->dirname, NULL);
+-	debugfs_create_file("entries", S_IRUGO, root, ppe, &mtk_ppe_debugfs_foe_all_fops);
+-	debugfs_create_file("bind", S_IRUGO, root, ppe, &mtk_ppe_debugfs_foe_bind_fops);
++	ppe->debugfs_dir = debugfs_create_dir(ppe->dirname, NULL);
++	if (IS_ERR(ppe->debugfs_dir)) {
++		int err = PTR_ERR(ppe->debugfs_dir);
++
++		ppe->debugfs_dir = NULL;
++		return err;
++	}
++
++	debugfs_create_file("entries", 0444, ppe->debugfs_dir, ppe,
++			    &mtk_ppe_debugfs_foe_all_fops);
++	debugfs_create_file("bind", 0444, ppe->debugfs_dir, ppe,
++			    &mtk_ppe_debugfs_foe_bind_fops);
+ 
+ 	return 0;
+ }
++
++void mtk_ppe_debugfs_deinit(struct mtk_ppe *ppe)
++{
++	debugfs_remove_recursive(ppe->debugfs_dir);
++	ppe->debugfs_dir = NULL;
++}

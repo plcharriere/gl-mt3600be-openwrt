@@ -1,0 +1,98 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sun, 27 Sep 2026 13:33:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: order driver removal safely
+
+mtk_remove() calls mtk_stop() for every netdev and later unregisters the
+still-running netdevs through mtk_cleanup().  Unregistration invokes
+ndo_stop a second time, underflowing the shared DMA refcount and disabling
+an already disabled SGMII clock.  mtk_cleanup() also destroys the SGMII PCS
+before unregistering the netdevs, and successful phylink instances are
+never destroyed before their netdev storage is freed.
+
+Cancel reset work first.  Unregister the netdevs while the PCS and
+hardware remain valid, then drain work requeued by phylink callbacks.
+Destroy each phylink and free its netdev before destroying the PCS.  This
+makes netdev unregistration the sole caller of ndo_stop and releases every
+object in dependency order.  Release the WED provider after netdev
+callbacks finish, then remove PPE tables and the MDIO bus before the
+Ethernet hardware is deinitialized.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 35 +++++++++++++++++------------------
+ 1 file changed, 17 insertions(+), 18 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4993,8 +4993,12 @@ static int mtk_free_dev(struct mtk_eth *
+ 	int i;
+ 
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
++		struct mtk_mac *mac;
++
+ 		if (!eth->netdev[i])
+ 			continue;
++		mac = netdev_priv(eth->netdev[i]);
++		phylink_destroy(mac->phylink);
+ 		free_netdev(eth->netdev[i]);
+ 	}
+ 
+@@ -5038,11 +5042,13 @@ static void mtk_sgmii_destroy(struct mtk
+ 
+ static int mtk_cleanup(struct mtk_eth *eth)
+ {
+-	mtk_sgmii_destroy(eth);
++	cancel_delayed_work_sync(&eth->reset.monitor_work);
++	cancel_work_sync(&eth->pending_work);
++
+ 	mtk_unreg_dev(eth);
+-	mtk_free_dev(eth);
+ 	cancel_work_sync(&eth->pending_work);
+-	cancel_delayed_work_sync(&eth->reset.monitor_work);
++	mtk_free_dev(eth);
++	mtk_sgmii_destroy(eth);
+ 
+ 	return 0;
+ }
+@@ -6068,31 +6074,24 @@ err_destroy_sgmii:
+ static void mtk_remove(struct platform_device *pdev)
+ {
+ 	struct mtk_eth *eth = platform_get_drvdata(pdev);
+-	struct mtk_mac *mac;
+-	int i;
+ 
+-	/* stop all devices to make sure that dma is properly shut down */
+-	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		if (!eth->netdev[i])
+-			continue;
+-		mtk_stop(eth->netdev[i]);
+-		mac = netdev_priv(eth->netdev[i]);
+-		phylink_disconnect_phy(mac->phylink);
+-	}
++	/* Unregistering the netdevs stops DMA while the hardware and PCS are
++	 * still available.
++	 */
++	mtk_cleanup(eth);
+ 
+ 	mtk_wed_exit();
+-	mtk_hw_deinit(eth);
+-
+-	netif_napi_del(&eth->tx_napi);
+-	netif_napi_del(&eth->rx_napi);
+-	mtk_cleanup(eth);
+ 	if (eth->soc->offload_version) {
+ 		rhashtable_destroy(&eth->flow_table);
+ 		mtk_ppe_deinit(eth);
+ 	}
+ 
+-	free_netdev(eth->dummy_dev);
+ 	mtk_mdio_cleanup(eth);
++	mtk_hw_deinit(eth);
++
++	netif_napi_del(&eth->tx_napi);
++	netif_napi_del(&eth->rx_napi);
++	free_netdev(eth->dummy_dev);
+ }
+ 
+ #define DESC_SIZE(struct_name)				\

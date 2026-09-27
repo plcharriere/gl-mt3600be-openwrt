@@ -1,0 +1,142 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Mon, 28 Sep 2026 20:08:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: fix netdev notifier lifetime
+
+mtk_add_mac() registers a per-MAC netdevice notifier before IRQ, MDIO and
+PPE initialization has completed.  Probe failures later free the netdev
+without unregistering that notifier, leaving the global notifier chain
+pointing into released memory.
+
+Track successful registration and keep the notifier alive until the MAC
+netdev has been unregistered, then release it before freeing the netdev.
+Also propagate notifier registration failures instead of ignoring them.
+Clear a failed MAC allocation from the driver's arrays and route every
+post-MAC probe failure through the common netdev cleanup path.  This
+prevents previously created MACs and their notifiers from leaking.
+
+Queue all registered MAC netdevs for one unregister_netdevice_many() call.
+They share DMA and interrupt state, so batching prevents the first MAC's
+ndo_uninit callback from masking interrupts while the second MAC is still
+being unregistered.
+
+Assisted-by: Codex:gpt-5.6-sol
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 32 ++++++++++++++++++++----------
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h |  1 +
+ 2 files changed, 23 insertions(+), 10 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1480,6 +1480,7 @@ struct mtk_mac {
+ 	int				hwlro_ip_cnt;
+ 	unsigned int			syscfg0;
+ 	struct notifier_block		device_notifier;
++	bool				device_notifier_registered;
+ 	u8				dsa_queue_base;
+ 	u8				dsa_port_rank[MTK_DSA_USER_PORT_MAX];
+ };
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4998,8 +4998,14 @@ static int mtk_free_dev(struct mtk_eth *
+ 		if (!eth->netdev[i])
+ 			continue;
+ 		mac = netdev_priv(eth->netdev[i]);
++		if (mac->device_notifier_registered) {
++			unregister_netdevice_notifier(&mac->device_notifier);
++			mac->device_notifier_registered = false;
++		}
+ 		phylink_destroy(mac->phylink);
+ 		free_netdev(eth->netdev[i]);
++		eth->netdev[i] = NULL;
++		eth->mac[i] = NULL;
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(eth->dsa_meta); i++) {
+@@ -5013,21 +5019,21 @@ static int mtk_free_dev(struct mtk_eth *
+ 
+ static int mtk_unreg_dev(struct mtk_eth *eth)
+ {
++	LIST_HEAD(unreg_list);
+ 	int i;
+ 
++	rtnl_lock();
+ 	for (i = 0; i < MTK_MAX_DEVS; i++) {
+-		struct mtk_mac *mac;
+ 		if (!eth->netdev[i])
+ 			continue;
+-		mac = netdev_priv(eth->netdev[i]);
+-		if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA))
+-			unregister_netdevice_notifier(&mac->device_notifier);
+ 
+ 		if (eth->netdev[i]->reg_state != NETREG_REGISTERED)
+ 			continue;
+ 
+-		unregister_netdev(eth->netdev[i]);
++		unregister_netdevice_queue(eth->netdev[i], &unreg_list);
+ 	}
++	unregister_netdevice_many(&unreg_list);
++	rtnl_unlock();
+ 
+ 	return 0;
+ }
+@@ -5640,7 +5646,10 @@ no_pcs:
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_QDMA)) {
+ 		mac->device_notifier.notifier_call = mtk_device_event;
+-		register_netdevice_notifier(&mac->device_notifier);
++		err = register_netdevice_notifier(&mac->device_notifier);
++		if (err)
++			goto destroy_phylink;
++		mac->device_notifier_registered = true;
+ 	}
+ 
+ 	if (mtk_page_pool_enabled(eth))
+@@ -5651,8 +5660,12 @@ no_pcs:
+ 
+ 	return 0;
+ 
++destroy_phylink:
++	phylink_destroy(mac->phylink);
+ free_netdev:
+ 	free_netdev(eth->netdev[id]);
++	eth->netdev[id] = NULL;
++	eth->mac[id] = NULL;
+ 	return err;
+ }
+ 
+@@ -5932,7 +5945,7 @@ static int mtk_probe(struct platform_dev
+ 		err = mtk_add_mac(eth, mac_np);
+ 		if (err) {
+ 			of_node_put(mac_np);
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 		}
+ 	}
+ 
+@@ -5945,7 +5958,7 @@ static int mtk_probe(struct platform_dev
+ 
+ 		err = mtk_mac_assign_address(eth, i, true);
+ 		if (err)
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 	}
+ 
+ 	/* now actually assign MAC addresses to netdevs */
+@@ -5955,7 +5968,7 @@ static int mtk_probe(struct platform_dev
+ 
+ 		err = mtk_mac_assign_address(eth, i, false);
+ 		if (err)
+-			goto err_deinit_hw;
++			goto err_free_dev;
+ 	}
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SHARED_INT)) {
+@@ -6061,7 +6074,6 @@ err_deinit_ppe:
+ 	mtk_mdio_cleanup(eth);
+ err_free_dev:
+ 	mtk_free_dev(eth);
+-err_deinit_hw:
+ 	mtk_hw_deinit(eth);
+ err_wed_exit:
+ 	mtk_wed_exit();
