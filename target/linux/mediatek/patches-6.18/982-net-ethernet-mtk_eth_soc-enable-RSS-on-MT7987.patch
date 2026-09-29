@@ -1,0 +1,27 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Tue, 29 Sep 2026 23:30:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: enable RSS on MT7987
+
+MT7987 has the same four PDMA RX rings and interrupts as MT7988.  Use them
+for RSS, so that received traffic is spread over four rings and CPUs
+instead of one.  The device tree provides the interrupts as pdma0 to
+pdma3; without them the driver keeps one RX ring.
+
+Based-on-patch-by: Mason Chang <mason-cw.chang@mediatek.com>
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/25.12/files/target/linux/mediatek/patches-6.12/999-eth-09-mtk_eth_soc-add-rss-support.patch
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -6877,6 +6877,7 @@ static const struct mtk_soc_data mt7986_
+ static const struct mtk_soc_data mt7987_data = {
+ 	.reg_map = &mt7988_reg_map,
+ 	.ana_rgc3 = 0x128,
++	.rss_num = 4,
+ 	.caps = MT7987_CAPS,
+ 	.hw_features = MTK_HW_FEATURES,
+ 	.required_clks = MT7987_CLKS_BITMAP,
