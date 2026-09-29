@@ -318,7 +318,29 @@ function dev_irq_cpus(path)
 	return map(filter(cpus, (cpu) => pinned[`${cpu.id}`]), (cpu) => cpu.id);
 }
 
+// With RSS, mtk_soc_eth runs one NAPI thread per RX ring in addition to the
+// TX one.  They are all named napi/mtk_eth-0, so they cannot be matched to RX
+// queues, and pinning them to one CPU undoes RSS.  The rings already spread
+// the flows over the CPUs: let the threads run on any CPU and leave RPS off.
+function assign_mtk_eth_rss_cpu(dev) {
+	let all = join(",", map(cpus, (cpu) => cpu.id));
+
+	for (let task in dev.tasks)
+		set_task_cpu(task, all);
+
+	for (let netdev in dev.netdev)
+		set_netdev_cpu(netdev, all_cpus ? -1 : null);
+
+	// Account the load as without RSS, so that the wireless devices keep
+	// their CPUs
+	dev.napi_cpu = get_next_cpu(napi_weight);
+	get_next_cpu(rx_weight, dev.napi_cpu);
+}
+
 function assign_dev_cpu(dev) {
+	if (dev.driver == "mtk_soc_eth" && length(dev.tasks) > 2)
+		return assign_mtk_eth_rss_cpu(dev);
+
 	if (length(dev.rx_queues) > 1 &&
 		length(dev.rx_tasks) > 1)
 		return assign_dev_queues_cpu(dev);
