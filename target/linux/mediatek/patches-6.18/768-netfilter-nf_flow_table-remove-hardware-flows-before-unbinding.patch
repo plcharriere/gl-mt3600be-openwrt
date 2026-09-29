@@ -1,0 +1,52 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Wed, 30 Sep 2026 04:30:00 +0900
+Subject: [PATCH] netfilter: nf_flow_table: remove hardware flows before
+ unbinding
+
+When a hardware offload flowtable is deleted, e.g. when the ruleset is
+replaced, the commit unbinds the flowtable from its devices, which
+removes the driver callbacks from its flow block, and the flowtable is
+freed later.  Its flows are torn down then, but their hardware rules are
+deleted through the callbacks of the block, which are gone: the driver
+keeps the rules.
+
+With mtk_eth_soc, the PPE keeps forwarding the flows past the new
+ruleset, and after they end, until the entries age out.  The driver also
+keeps its entries for the flows, keyed by the address of the flow tuple,
+and a later flow allocated at the same address gets -EEXIST from it and
+stays in software.
+
+Remove the flows of a device from the hardware before unbinding it, as
+nf_flow_table_indr_cleanup() does when an indirect block goes away, and
+run the GC a second time after the offload work is flushed: the first
+pass cannot queue the delete work of a flow whose add or stats work is
+still pending.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1347,6 +1347,19 @@ int nf_flow_table_offload_setup(struct n
+ 	if (!nf_flowtable_hw_offload(flowtable))
+ 		return nf_flow_offload_xdp_setup(flowtable, dev, cmd);
+ 
++	/* Hardware rules are deleted through the callbacks of the block:
++	 * delete those of the flows of the device before unbinding it.  A
++	 * flow whose offload work was pending in the first GC pass gets its
++	 * delete work in a second one.
++	 */
++	if (cmd == FLOW_BLOCK_UNBIND) {
++		nf_flow_table_gc_cleanup(flowtable, dev);
++		mod_delayed_work(system_power_efficient_wq,
++				 &flowtable->gc_work, 0);
++		flush_delayed_work(&flowtable->gc_work);
++		flush_workqueue(nf_flow_offload_del_wq);
++	}
++
+ 	if (dev->netdev_ops->ndo_setup_tc)
+ 		err = nf_flow_table_offload_cmd(&bo, flowtable, dev, cmd,
+ 						&extack);
