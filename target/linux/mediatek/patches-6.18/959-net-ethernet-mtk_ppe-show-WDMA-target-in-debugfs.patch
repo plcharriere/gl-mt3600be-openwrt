@@ -1,0 +1,66 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Tue, 29 Sep 2026 14:20:00 +0900
+Subject: [PATCH] net: ethernet: mtk_ppe: show WDMA target in debugfs
+
+For entries that forward to Wi-Fi through WDMA, also print the BSS index
+and the station WCID encoded in the entry, so a stale target can be told
+apart from a current one.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_debugfs.c
+@@ -73,6 +73,38 @@ mtk_print_addr_info(struct seq_file *m,
+ 		seq_printf(m, ":%d", *ai->dest_port);
+ }
+ 
++static void
++mtk_ppe_debugfs_wdma_show(struct seq_file *m, struct mtk_eth *eth,
++			  const struct mtk_foe_mac_info *l2, u32 ib2)
++{
++	unsigned long bss, wcid;
++
++	switch (eth->soc->version) {
++	case 3:
++		if (!(ib2 & MTK_FOE_IB2_WDMA_WINFO_V2))
++			return;
++		bss = FIELD_GET(MTK_FOE_WINFO_BSS_V3, l2->w3info);
++		wcid = FIELD_GET(MTK_FOE_WINFO_WCID_V3, l2->w3info);
++		break;
++	case 2:
++		if (!(ib2 & MTK_FOE_IB2_WDMA_WINFO_V2))
++			return;
++		bss = FIELD_GET(MTK_FOE_WINFO_BSS, l2->winfo);
++		wcid = FIELD_GET(MTK_FOE_WINFO_WCID, l2->winfo);
++		break;
++	default:
++		/* the WINFO bit is also the top bit of PORT_MG */
++		if (!(ib2 & MTK_FOE_IB2_WDMA_WINFO) ||
++		    FIELD_GET(MTK_FOE_IB2_DEST_PORT, ib2) != 3)
++			return;
++		bss = FIELD_GET(MTK_FOE_VLAN2_WINFO_BSS, l2->vlan2);
++		wcid = FIELD_GET(MTK_FOE_VLAN2_WINFO_WCID, l2->vlan2);
++		break;
++	}
++
++	seq_printf(m, " wdma_bss=%lu wdma_wcid=%lu", bss, wcid);
++}
++
+ static int
+ mtk_ppe_debugfs_foe_show(struct seq_file *m, void *private, bool bind)
+ {
+@@ -158,10 +190,12 @@ mtk_ppe_debugfs_foe_show(struct seq_file
+ 
+ 		seq_printf(m, " eth=%pM->%pM etype=%04x"
+ 			      " vlan=%d,%d ib1=%08x ib2=%08x"
+-			      " packets=%llu bytes=%llu\n",
++			      " packets=%llu bytes=%llu",
+ 			   h_source, h_dest, ntohs(l2->etype),
+ 			   l2->vlan1, l2->vlan2, entry->ib1, ib2,
+ 			   acct ? acct->packets : 0, acct ? acct->bytes : 0);
++		mtk_ppe_debugfs_wdma_show(m, ppe->eth, l2, ib2);
++		seq_putc(m, '\n');
+ 	}
+ 
+ 	return 0;
