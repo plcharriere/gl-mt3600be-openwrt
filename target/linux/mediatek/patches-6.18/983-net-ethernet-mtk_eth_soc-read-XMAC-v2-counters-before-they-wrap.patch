@@ -1,0 +1,114 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Tue, 29 Sep 2026 23:45:00 +0900
+Subject: [PATCH] net: ethernet: mtk_eth_soc: read XMAC-v2 counters before they
+ wrap
+
+The XMAC-v2 counters of the MT7987 2.5G ports are cleared on read and
+have no almost-full interrupt, so they are only read when the statistics
+are.  Their 32-bit byte counters wrap after 13.7 s at 2.5 Gbit/s and the
+pause counter keeps 16 bits, so the statistics lose 4 GiB per wrap when
+nothing reads them for longer than that.
+
+Read the counters of the MACs every second from the reset monitor, as
+MediaTek's SER monitor does.
+
+The DMA hang check of the monitor reads the RX pause frame counters of
+the GDMs, to tell a port that its link partner pauses from a hung one.
+They are cleared on read too and the statistics read them, so the check
+misses the pause frames that the statistics took since its last run.
+Take them from the statistics instead.
+
+Based-on-patch-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/25.12/files/target/linux/mediatek/patches-6.12/999-eth-11-mtk_eth_soc-refactor-forced-reset-monitor.patch
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_eth_soc.c | 40 +++++++++++++++++++--
+ drivers/net/ethernet/mediatek/mtk_eth_soc.h |  1 +
+ 2 files changed, 38 insertions(+), 3 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -4890,19 +4890,48 @@ static void mtk_hw_warm_reset(struct mtk
+ 			val, rst_mask);
+ }
+ 
++/* RX pause frames of a MAC since the previous run of the hang check.  The
++ * counters are cleared on read and the statistics read them, so reading them
++ * here would miss the frames that the statistics already took.
++ */
++static u64 mtk_hw_rx_pause_frames(struct mtk_eth *eth, int id)
++{
++	struct mtk_hw_stats *hw_stats;
++	unsigned int start;
++	u64 fc, delta;
++
++	if (!eth->mac[id] || !eth->mac[id]->hw_stats)
++		return 0;
++
++	hw_stats = eth->mac[id]->hw_stats;
++	do {
++		start = u64_stats_fetch_begin(&hw_stats->syncp);
++		fc = hw_stats->rx_flow_control_packets;
++	} while (u64_stats_fetch_retry(&hw_stats->syncp, start));
++
++	delta = fc - eth->reset.rx_fc[id];
++	eth->reset.rx_fc[id] = fc;
++
++	return delta;
++}
++
+ static bool mtk_hw_check_dma_hang(struct mtk_eth *eth)
+ {
+ 	const struct mtk_reg_map *reg_map = eth->soc->reg_map;
+ 	bool gmac1_tx, gmac2_tx, gdm1_tx, gdm2_tx;
+ 	bool oq_hang, cdm1_busy, adma_busy;
+ 	bool wtx_busy, cdm_full, oq_free;
+-	u32 wdidx, val, gdm1_fc, gdm2_fc;
+ 	bool qfsm_hang, qfwd_hang;
++	u64 gdm1_fc, gdm2_fc;
+ 	bool ret = false;
++	u32 wdidx, val;
+ 
+ 	if (MTK_HAS_CAPS(eth->soc->caps, MTK_SOC_MT7628))
+ 		return false;
+ 
++	gdm1_fc = mtk_hw_rx_pause_frames(eth, MTK_GMAC1_ID);
++	gdm2_fc = mtk_hw_rx_pause_frames(eth, MTK_GMAC2_ID);
++
+ 	/* WDMA sanity checks */
+ 	wdidx = mtk_r32(eth, reg_map->wdma_base[0] + 0xc);
+ 
+@@ -4932,8 +4961,6 @@ static bool mtk_hw_check_dma_hang(struct
+ 	gdm2_tx = FIELD_GET(GENMASK(31, 16), mtk_r32(eth, MTK_FE_GDM2_FSM)) > 0;
+ 	gmac1_tx = FIELD_GET(GENMASK(31, 24), mtk_r32(eth, MTK_MAC_FSM(0))) != 1;
+ 	gmac2_tx = FIELD_GET(GENMASK(31, 24), mtk_r32(eth, MTK_MAC_FSM(1))) != 1;
+-	gdm1_fc = mtk_r32(eth, reg_map->gdm1_cnt + 0x24);
+-	gdm2_fc = mtk_r32(eth, reg_map->gdm1_cnt + 0x64);
+ 
+ 	if (qfsm_hang && qfwd_hang &&
+ 	    ((gdm1_tx && gmac1_tx && gdm1_fc < 1) ||
+@@ -4977,6 +5004,13 @@ static void mtk_hw_reset_monitor_work(st
+ 	if (test_bit(MTK_RESETTING, &eth->state))
+ 		goto out;
+ 
++	/* Read the counters of the MACs every second.  Nothing signals the
++	 * XMAC-v2 ones before they wrap, and their 32-bit byte counters wrap
++	 * after 13.7 s at 2.5 Gbit/s.  The hang check takes the RX pause
++	 * frames from the statistics.
++	 */
++	mtk_stats_update(eth);
++
+ 	/* DMA stuck checks */
+ 	if (mtk_hw_check_dma_hang(eth))
+ 		schedule_work(&eth->pending_work);
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1525,6 +1525,7 @@ struct mtk_eth {
+ 
+ 	struct {
+ 		struct delayed_work monitor_work;
++		u64 rx_fc[MTK_MAX_DEVS];
+ 		u32 wdidx;
+ 		u8 wdma_hang_count;
+ 		u8 qdma_hang_count;
