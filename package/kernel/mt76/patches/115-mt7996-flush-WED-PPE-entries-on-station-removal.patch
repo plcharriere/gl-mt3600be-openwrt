@@ -1,0 +1,106 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Tue, 29 Sep 2026 14:30:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: flush WED PPE entries on station removal
+
+With WED, the PPE forwards a flow offloaded to a station to the WCID of
+the station's default link.  Nothing removed these entries when the
+station left, so the flow kept going to the old WCID for as long as the
+sender kept sending.  When the station reconnected with another WCID it
+stopped receiving the flow, and when another station got the old WCID it
+received the flow instead.
+
+Ask WED to flush the station's PPE entries before its WCIDs are released.
+On a full chip reset, flush the entries of all stations once they are
+unlinked, as mac80211 then adds them back with new WCIDs.  When an MLO
+station drops links, flush them too, as its default link may move.  The
+flows fall back to software forwarding, which offloads them again to the
+current WCID.
+
+Use one helper to pick the WED device of a WCID here and in the forward
+path.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2528,6 +2528,17 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	dev->mld_remap_idx_mask = 0;
+ 
+ 	ieee80211_iterate_stations_atomic(hw, mt7996_mac_reset_sta_iter, dev);
++
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	/* The stations are unlinked now, and get new WCIDs when mac80211 adds
++	 * them back.
++	 */
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed))
++		mtk_wed_device_ppe_flush_wcid(&dev->mt76.mmio.wed, -1);
++	if (mtk_wed_device_active(&dev->mt76.mmio.wed_hif2))
++		mtk_wed_device_ppe_flush_wcid(&dev->mt76.mmio.wed_hif2, -1);
++#endif
++
+ 	mt76_reset_device(&dev->mt76);
+ 	ieee80211_iterate_active_interfaces_atomic(hw,
+ 						   IEEE80211_IFACE_SKIP_SDATA_NOT_IN_DRIVER,
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1962,11 +1962,43 @@ mt7996_mac_sta_links_bss_add(struct mt79
+ 	}
+ }
+ 
++static struct mtk_wed_device *
++mt7996_sta_wed(struct mt7996_dev *dev, struct mt7996_sta_link *msta_link);
++
++/* A PPE entry that offloads a flow to Wi-Fi carries the WCID of the
++ * station's default link. Remove the entries of @links once they no longer
++ * resolve, so that a station given one of their WCIDs later does not receive
++ * the flows, which get offloaded again to the current link.
++ */
++static void
++mt7996_mac_sta_flush_wed(struct mt7996_dev *dev, struct mt7996_sta *msta,
++			 unsigned long links)
++{
++#ifdef CONFIG_NET_MEDIATEK_SOC_WED
++	unsigned int link_id;
++
++	for_each_set_bit(link_id, &links, IEEE80211_MLD_MAX_NUM_LINKS) {
++		struct mt7996_sta_link *msta_link;
++		struct mtk_wed_device *wed;
++
++		msta_link = mt76_dereference(msta->link[link_id], &dev->mt76);
++		if (!msta_link)
++			continue;
++
++		wed = mt7996_sta_wed(dev, msta_link);
++		if (mtk_wed_device_active(wed))
++			mtk_wed_device_ppe_flush_wcid(wed,
++						      msta_link->wcid.idx);
++	}
++#endif
++}
++
+ static int
+ mt7996_mac_sta_change_links(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+ 			    struct ieee80211_sta *sta, u16 old_links,
+ 			    u16 new_links)
+ {
++	struct mt7996_sta *msta = (struct mt7996_sta *)sta->drv_priv;
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	unsigned long add = new_links & ~old_links;
+ 	unsigned long rem = old_links & ~new_links;
+@@ -1976,6 +2008,7 @@ mt7996_mac_sta_change_links(struct ieee8
+ 
+ 	mt7996_mac_sta_links_reset(dev, vif, sta, rem);
+ 	mt7996_mac_sta_remove_links(dev, vif, sta, rem, false);
++	mt7996_mac_sta_flush_wed(dev, msta, rem);
+ 	mt7996_mac_sta_links_bss_add(dev, vif, sta, add);
+ 	ret = mt7996_mac_sta_add_links(dev, vif, sta, add);
+ 	if (ret)
+@@ -2002,6 +2035,7 @@ mt7996_mac_sta_remove(struct mt7996_dev
+ 	int i;
+ 
+ 	mutex_lock(&dev->mt76.mutex);
++	mt7996_mac_sta_flush_wed(dev, msta, ~0UL);
+ 	for (i = 0; i < ARRAY_SIZE(msta->link); i++)
+ 		mt7996_mac_sta_remove_link(dev, sta, i, true);
+ 	mutex_unlock(&dev->mt76.mutex);
