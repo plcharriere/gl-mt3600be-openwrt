@@ -1,0 +1,264 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Tue, 29 Sep 2026 14:10:00 +0900
+Subject: [PATCH] net: ethernet: mtk_wed: flush PPE entries of removed stations
+
+A PPE entry that forwards to Wi-Fi through WDMA carries the station's
+WCID, fixed when the flow was offloaded.  When the station disconnects,
+nothing removes the entry: the flow stays offloaded as long as the sender
+keeps sending, and the WLAN driver can give the WCID to another station.
+A station that reconnects then stops receiving the flow, and the station
+that got its old WCID receives it instead.
+
+Add a WED operation that removes the entries sending to a WCID, or to any
+station of the WED device, so that the WLAN driver can call it before it
+releases a WCID.  It only takes the PPE lock, as the driver calls it with
+its own locks held: it invalidates the entries in the PPE and marks their
+flows stale, and the next STATS or REPLACE of such a flow frees it.  A
+REPLACE that resolved its WDMA target before a flush and installed it
+after removes its entry again and fails, and the flowtable retries it.
+The flowtable still owns the flows: their packets go back to the software
+path, which offloads them again with the current WDMA target, or not at
+all if the station is gone.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.h
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.h
+@@ -1653,6 +1653,7 @@ int mtk_flow_offload_idle_wcid(struct mt
+ 			       const struct mtk_flow_match *match);
+ int mtk_flow_offload_cmd(struct mtk_eth *eth, struct flow_cls_offload *cls,
+ 			 int ppe_index);
++void mtk_flow_offload_flush_wcid(struct mtk_eth *eth, int wdma_idx, int wcid);
+ void mtk_flow_offload_cleanup(struct mtk_eth *eth, struct list_head *list);
+ void mtk_eth_set_dma_device(struct mtk_eth *eth, struct device *dma_dev);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.h
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.h
+@@ -318,6 +318,7 @@ struct mtk_flow_entry {
+ 	s8 wed_index;
+ 	s8 rx_wed_index;
+ 	u8 ppe_index;
++	bool stale;
+ 	u16 hash;
+ 	u16 wcid;
+ 	u16 rx_wcid;
+@@ -424,6 +425,7 @@ int mtk_foe_entry_set_queue(struct mtk_e
+ 			    unsigned int queue);
+ int mtk_foe_entry_commit(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
+ void mtk_foe_entry_clear(struct mtk_ppe *ppe, struct mtk_flow_entry *entry);
++void mtk_ppe_flush_wcid(struct mtk_ppe *ppe, int wdma_idx, int wcid);
+ void mtk_foe_entry_unbind(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+ 			  bool rx, const struct mtk_flow_match *match);
+ int mtk_foe_entry_flow_idle(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
+--- a/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe_offload.c
+@@ -47,6 +47,9 @@ struct mtk_flow_data {
+ 	} pppoe;
+ };
+ 
++/* Counts station flushes, see mtk_flow_offload_replace() */
++static atomic_t mtk_flow_flush_seq = ATOMIC_INIT(0);
++
+ static const struct rhashtable_params mtk_flow_ht_params = {
+ 	.head_offset = offsetof(struct mtk_flow_entry, node),
+ 	.key_offset = offsetof(struct mtk_flow_entry, cookie),
+@@ -306,6 +309,17 @@ mtk_flow_is_valid_idev(const struct mtk_
+ 	return false;
+ }
+ 
++static void
++mtk_flow_entry_remove(struct mtk_eth *eth, struct mtk_flow_entry *entry)
++{
++	mtk_foe_entry_clear(eth->ppe[entry->ppe_index], entry);
++	rhashtable_remove_fast(&eth->flow_table, &entry->node,
++			       mtk_flow_ht_params);
++	if (entry->wed_index >= 0)
++		mtk_wed_flow_remove(entry->wed_index);
++	kfree(entry);
++}
++
+ static int
+ mtk_flow_offload_replace(struct mtk_eth *eth, struct flow_cls_offload *f,
+ 			 int ppe_index)
+@@ -317,6 +331,7 @@ mtk_flow_offload_replace(struct mtk_eth
+ 	struct mtk_foe_entry foe;
+ 	struct mtk_flow_entry *entry;
+ 	int offload_type = 0;
++	unsigned int flush_seq;
+ 	int wed_index = -1;
+ 	u16 addr_type = 0;
+ 	u16 wcid = 0;
+@@ -324,9 +339,19 @@ mtk_flow_offload_replace(struct mtk_eth
+ 	int err = 0;
+ 	int i;
+ 
+-	if (rhashtable_lookup_fast(&eth->flow_table, &f->cookie,
+-				   mtk_flow_ht_params))
+-		return -EEXIST;
++	entry = rhashtable_lookup_fast(&eth->flow_table, &f->cookie,
++				       mtk_flow_ht_params);
++	if (entry) {
++		if (!READ_ONCE(entry->stale))
++			return -EEXIST;
++
++		/* flushed when its station left: offload it again */
++		mtk_flow_entry_remove(eth, entry);
++	}
++
++	/* Read before a WDMA path is resolved, see the check after commit */
++	flush_seq = atomic_read(&mtk_flow_flush_seq);
++	smp_rmb();
+ 
+ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META)) {
+ 		struct flow_match_meta match;
+@@ -565,6 +590,15 @@ mtk_flow_offload_replace(struct mtk_eth
+ 	if (err < 0)
+ 		goto clear;
+ 
++	/* The station may have left while its WDMA path was resolved, and its
++	 * flush may have run before the commit.  ppe_lock orders the commit
++	 * and the flush, so such a flush has already changed the count.
++	 */
++	if (wed_index >= 0 && atomic_read(&mtk_flow_flush_seq) != flush_seq) {
++		mtk_flow_entry_remove(eth, entry);
++		return -EAGAIN;
++	}
++
+ 	return 0;
+ 
+ clear:
+@@ -586,12 +620,7 @@ mtk_flow_offload_destroy(struct mtk_eth
+ 	if (!entry)
+ 		return -ENOENT;
+ 
+-	mtk_foe_entry_clear(eth->ppe[entry->ppe_index], entry);
+-	rhashtable_remove_fast(&eth->flow_table, &entry->node,
+-			       mtk_flow_ht_params);
+-	if (entry->wed_index >= 0)
+-		mtk_wed_flow_remove(entry->wed_index);
+-	kfree(entry);
++	mtk_flow_entry_remove(eth, entry);
+ 
+ 	return 0;
+ }
+@@ -608,6 +637,11 @@ mtk_flow_offload_stats(struct mtk_eth *e
+ 	if (!entry)
+ 		return -ENOENT;
+ 
++	if (READ_ONCE(entry->stale)) {
++		mtk_flow_entry_remove(eth, entry);
++		return -ENOENT;
++	}
++
+ 	packets = entry->packets;
+ 	bytes = entry->bytes;
+ 	mtk_foe_entry_get_stats(eth->ppe[entry->ppe_index], entry, &idle);
+@@ -738,6 +772,21 @@ int mtk_flow_offload_idle_wcid(struct mt
+ 	return data.idle;
+ }
+ 
++/* Called by WED when a station leaves, before its WCID can be reused */
++void mtk_flow_offload_flush_wcid(struct mtk_eth *eth, int wdma_idx, int wcid)
++{
++	int i;
++
++	/* Fully ordered, so a REPLACE that reads the new count also sees the
++	 * station unpublished by the WLAN driver before this call.
++	 */
++	atomic_inc_return(&mtk_flow_flush_seq);
++
++	for (i = 0; i < eth->soc->ppe_num; i++)
++		if (eth->ppe[i])
++			mtk_ppe_flush_wcid(eth->ppe[i], wdma_idx, wcid);
++}
++
+ static int
+ mtk_eth_setup_tc_block_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
+ {
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -2430,6 +2430,12 @@ mtk_wed_flow_idle(struct mtk_wed_device
+ }
+ 
+ static void
++mtk_wed_ppe_flush_wcid(struct mtk_wed_device *dev, int wcid)
++{
++	mtk_flow_offload_flush_wcid(dev->hw->eth, dev->hw->index, wcid);
++}
++
++static void
+ mtk_wed_configure_irq(struct mtk_wed_device *dev, u32 irq_mask)
+ {
+ 	u32 wdma_mask = FIELD_PREP(MTK_WDMA_INT_MASK_RX_DONE, GENMASK(1, 0));
+@@ -3339,6 +3345,7 @@ void mtk_wed_add_hw(struct device_node *
+ 		.irq_set_mask = mtk_wed_irq_set_mask,
+ 		.detach = mtk_wed_detach,
+ 		.ppe_check = mtk_wed_ppe_check,
++		.ppe_flush_wcid = mtk_wed_ppe_flush_wcid,
+ 		.get_hw_version = mtk_wed_get_hw_version,
+ 		.setup_tc = mtk_wed_setup_tc,
+ 		.start_hw_rro = mtk_wed_start_hw_rro,
+--- a/include/linux/soc/mediatek/mtk_wed.h
++++ b/include/linux/soc/mediatek/mtk_wed.h
+@@ -226,6 +226,7 @@ struct mtk_wed_ops {
+ 	void (*detach)(struct mtk_wed_device *dev);
+ 	void (*ppe_check)(struct mtk_wed_device *dev, struct sk_buff *skb,
+ 			  u32 reason, u32 hash, u16 wcid);
++	void (*ppe_flush_wcid)(struct mtk_wed_device *dev, int wcid);
+ 
+ 	void (*stop)(struct mtk_wed_device *dev);
+ 	void (*start)(struct mtk_wed_device *dev, u32 irq_mask);
+@@ -346,6 +347,8 @@ static inline bool mtk_wed_is_amsdu_supp
+ 	(_dev)->ops->rx_ring_setup(_dev, _ring, _regs, _reset)
+ #define mtk_wed_device_ppe_check(_dev, _skb, _reason, _hash, _wcid) \
+ 	(_dev)->ops->ppe_check(_dev, _skb, _reason, _hash, _wcid)
++#define mtk_wed_device_ppe_flush_wcid(_dev, _wcid) \
++	(_dev)->ops->ppe_flush_wcid(_dev, _wcid)
+ #define mtk_wed_device_update_msg(_dev, _id, _msg, _len) \
+ 	(_dev)->ops->msg_update(_dev, _id, _msg, _len)
+ #define mtk_wed_device_stop(_dev) (_dev)->ops->stop(_dev)
+@@ -383,6 +386,7 @@ static inline bool mtk_wed_device_active
+ #define mtk_wed_device_rx_ring_setup(_dev, _ring, _regs, _reset) -ENODEV
+ #define mtk_wed_device_ppe_check(_dev, _skb, _reason, _hash, _wcid) \
+ 	do {} while (0)
++#define mtk_wed_device_ppe_flush_wcid(_dev, _wcid) do {} while (0)
+ #define mtk_wed_device_update_msg(_dev, _id, _msg, _len) -ENODEV
+ #define mtk_wed_device_stop(_dev) do {} while (0)
+ #define mtk_wed_device_dma_reset(_dev) do {} while (0)
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -949,6 +949,33 @@ void mtk_foe_entry_clear(struct mtk_ppe
+ 	spin_unlock_bh(&ppe_lock);
+ }
+ 
++/* Invalidate the flows that send to station @wcid through WDMA @wdma_idx, or
++ * to any station of it if @wcid is negative, and mark them stale.  Unlinked,
++ * they cannot be bound again; the offload code frees them later.  This only
++ * takes ppe_lock, so the WLAN driver can call it with its own locks held.
++ */
++void mtk_ppe_flush_wcid(struct mtk_ppe *ppe, int wdma_idx, int wcid)
++{
++	unsigned int i, n = MTK_PPE_ENTRIES / ppe->eth->soc->hash_offset;
++	struct mtk_flow_entry *entry;
++	struct hlist_node *tmp;
++
++	spin_lock_bh(&ppe_lock);
++	for (i = 0; i < n; i++) {
++		hlist_for_each_entry_safe(entry, tmp, &ppe->foe_flow[i], list) {
++			if (entry->type != MTK_FLOW_TYPE_L4 ||
++			    entry->wed_index != wdma_idx ||
++			    (wcid >= 0 && entry->wcid != wcid))
++				continue;
++
++			__mtk_foe_entry_clear(ppe, entry, true);
++			hlist_del_init(&entry->list);
++			WRITE_ONCE(entry->stale, true);
++		}
++	}
++	spin_unlock_bh(&ppe_lock);
++}
++
+ static int
+ mtk_foe_entry_commit_l2(struct mtk_ppe *ppe, struct mtk_flow_entry *entry)
+ {
