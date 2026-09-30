@@ -1,0 +1,34 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 02:30:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: send no beacon for a link the firmware
+ does not know
+
+After a full reset, mac80211 adds the channel contexts back before the
+interfaces, and mt7996_set_channel() updates the beacons of every
+interface, including those not added back yet.  hostapd can also update
+a beacon in that window.  The firmware then gets the beacon of a BSS it
+does not know yet, and ignores the beacons it gets once the BSS is added
+again: the AP sends no beacon until it is restarted.
+
+Send the beacon of a link only once the link has been added to the
+firmware.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mcu.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -3813,6 +3813,10 @@ int mt7996_mcu_add_beacon(struct ieee802
+ 	if (!link_conf->csa_active)
+ 		link->csa_bcn_uploaded = false;
+ 
++	/* a beacon for an unknown BSS makes the firmware ignore later ones */
++	if (!(mlink->mvif->valid_links & BIT(link_conf->link_id)))
++		return 0;
++
+ 	if (mphy && mphy->offchannel)
+ 		enabled = false;
+ 
