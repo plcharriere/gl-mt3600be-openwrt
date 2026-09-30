@@ -1,0 +1,183 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 01:55:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: keep the TX PN across a full reset
+
+The hardware generates the TX PN of the keys it encrypts with, and keeps
+it in the UWTBL entry of the station, or of the BSS for the group key.
+After a full reset, mac80211 installs the keys again and the new firmware
+starts their PN at zero.  The stations drop every frame as a replay until
+the PN has passed the last one they saw, which takes as many frames as
+they had received before: they stay associated but get nothing, until
+they give up and associate again.
+
+Read the PN of every key twice a second, and after a full reset continue
+2^32 above the last value read when a key is installed again.  Stations
+then keep their association over a full reset.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mac.c    | 63 +++++++++++++++++++++++++++++++++++++++++++++++++
+ mt7996/main.c   |  4 ++++
+ mt7996/mt7996.h |  5 ++++
+ mt7996/regs.h   | 15 ++++++++++++
+ 4 files changed, 87 insertions(+)
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -72,6 +72,67 @@ u32 mt7996_mac_wtbl_lmac_addr(struct mt7
+ 	return MT_WTBL_LMAC_OFFS(wcid, dw);
+ }
+ 
++static u32 mt7996_mac_wtbl_umac_addr(struct mt7996_dev *dev, u16 wcid, u8 dw)
++{
++	mt76_wr(dev, MT_UWTBL_TOP_WDUCR,
++		FIELD_PREP(MT_UWTBL_TOP_WDUCR_GROUP, (wcid >> 7)));
++
++	return MT_UWTBL_OFFS(wcid, dw);
++}
++
++/* The hardware keeps the TX PN of a station, or of the group key of a BSS,
++ * in the UWTBL.  A new firmware starts it at zero again, and the receivers
++ * then drop everything as replays until it has passed the last PN they saw.
++ * Remember the PN of every key, to continue above it after a full reset.
++ */
++#define MT7996_TX_PN_GAP	BIT_ULL(32)
++
++static void mt7996_mac_save_tx_pn(struct mt7996_phy *phy)
++{
++	struct mt7996_dev *dev = phy->dev;
++	int i;
++
++	rcu_read_lock();
++	for (i = 0; i < mt7996_wtbl_size(dev); i++) {
++		struct mt7996_sta_link *msta_link;
++		struct mt76_wcid *wcid;
++		u32 addr, lo, hi;
++
++		wcid = rcu_dereference(dev->mt76.wcid[i]);
++		if (!wcid || wcid->phy_idx != phy->mt76->band_idx ||
++		    wcid->hw_key_idx == (u8)-1)
++			continue;
++
++		addr = mt7996_mac_wtbl_umac_addr(dev, i, 2);
++		hi = mt76_get_field(dev, addr + 4, MT_UWTBL_DW3_PN_HI);
++		lo = mt76_rr(dev, addr);
++		if (hi != mt76_get_field(dev, addr + 4, MT_UWTBL_DW3_PN_HI))
++			continue;
++
++		/* failed register reads return all ones */
++		if (hi == MT_UWTBL_DW3_PN_HI && lo == ~0)
++			continue;
++
++		msta_link = container_of(wcid, struct mt7996_sta_link, wcid);
++		msta_link->tx_pn = (u64)hi << 32 | lo;
++	}
++	rcu_read_unlock();
++}
++
++void mt7996_mac_restore_tx_pn(struct mt7996_dev *dev,
++			      struct mt7996_sta_link *msta_link)
++{
++	u64 pn = msta_link->tx_pn + MT7996_TX_PN_GAP;
++	u32 addr;
++
++	if (!msta_link->tx_pn || upper_32_bits(pn) > MT_UWTBL_DW3_PN_HI)
++		return;
++
++	addr = mt7996_mac_wtbl_umac_addr(dev, msta_link->wcid.idx, 2);
++	mt76_wr(dev, addr, lower_32_bits(pn));
++	mt76_rmw_field(dev, addr + 4, MT_UWTBL_DW3_PN_HI, upper_32_bits(pn));
++}
++
+ static void mt7996_mac_sta_poll(struct mt7996_dev *dev)
+ {
+ 	static const u8 ac_to_tid[] = {
+@@ -2479,6 +2540,7 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	int i;
+ 
+ 	dev->recovery.hw_full_reset = true;
++	dev->recovery.restore_tx_pn = true;
+ 
+ 	set_bit(MT76_RESTART, &dev->mphy.state);
+ 	set_bit(MT76_MCU_RESET, &dev->mphy.state);
+@@ -3022,6 +3084,7 @@ void mt7996_mac_work(struct work_struct
+ 		mphy->mac_work_count = 0;
+ 
+ 		mt7996_mac_update_stats(phy);
++		mt7996_mac_save_tx_pn(phy);
+ 
+ 		mt7996_mcu_get_all_sta_info(phy, UNI_ALL_STA_TXRX_RATE);
+ 		if (mtk_wed_device_active(&phy->dev->mt76.mmio.wed)) {
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -268,6 +268,8 @@ mt7996_set_hw_key(struct ieee80211_hw *h
+ 	err = mt7996_mcu_add_key(&dev->mt76, link, key,
+ 				 MCU_WMWA_UNI_CMD(STA_REC_UPDATE),
+ 				 &msta_link->wcid, cmd);
++	if (!err && cmd == SET_KEY && !is_bigtk && dev->recovery.restore_tx_pn)
++		mt7996_mac_restore_tx_pn(dev, msta_link);
+ 
+ 	/* remove and add beacon in order to enable beacon protection */
+ 	if (cmd == SET_KEY && is_bigtk && link_conf->enable_beacon) {
+@@ -3111,6 +3113,8 @@ mt7996_reconfig_complete(struct ieee8021
+ 	struct mt7996_dev *dev = mt7996_hw_dev(hw);
+ 	struct mt7996_phy *phy;
+ 
++	dev->recovery.restore_tx_pn = false;
++
+ 	ieee80211_wake_queues(hw);
+ 	mt7996_for_each_phy(dev, phy)
+ 		ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -306,6 +306,8 @@ struct mt7996_sta_link {
+ 
+ 	struct mt76_connac_sta_key_conf bip;
+ 
++	u64 tx_pn;
++
+ 	struct {
+ 		u8 flowid_mask;
+ 		struct mt7996_twt_flow flow[MT7996_MAX_STA_TWT_AGRT];
+@@ -510,6 +512,7 @@ struct mt7996_dev {
+ 		u32 wa_reset_count;
+ 		u32 wm_reset_count;
+ 		bool hw_full_reset:1;
++		bool restore_tx_pn:1;
+ 		bool hw_init_done:1;
+ 		bool restart:1;
+ 	} recovery;
+@@ -984,6 +987,8 @@ void mt7996_mac_write_txwi(struct mt7996
+ 			   unsigned int link_id);
+ void mt7996_mac_update_beacons(struct mt7996_phy *phy);
+ void mt7996_mac_set_coverage_class(struct mt7996_phy *phy);
++void mt7996_mac_restore_tx_pn(struct mt7996_dev *dev,
++			      struct mt7996_sta_link *msta_link);
+ void mt7996_mac_work(struct work_struct *work);
+ void mt7996_mac_reset_work(struct work_struct *work);
+ void mt7996_mac_dump_work(struct work_struct *work);
+--- a/mt7996/regs.h
++++ b/mt7996/regs.h
+@@ -379,6 +379,21 @@ enum offs_rev {
+ 						 FIELD_PREP(MT_WTBL_LMAC_ID, _id) | \
+ 						 FIELD_PREP(MT_WTBL_LMAC_DW, _dw))
+ 
++/* UWTBL */
++#define MT_UWTBL_TOP_BASE			0x820c4000
++#define MT_UWTBL_TOP(ofs)			(MT_UWTBL_TOP_BASE + (ofs))
++
++#define MT_UWTBL_TOP_WDUCR			MT_UWTBL_TOP(0x104)
++#define MT_UWTBL_TOP_WDUCR_GROUP		GENMASK(5, 0)
++
++#define MT_UWTBL_BASE				MT_UWTBL_TOP(0x2000)
++#define MT_UWTBL_ID				GENMASK(12, 6)
++#define MT_UWTBL_DW				GENMASK(5, 2)
++#define MT_UWTBL_OFFS(_id, _dw)			(MT_UWTBL_BASE | \
++						 FIELD_PREP(MT_UWTBL_ID, _id) | \
++						 FIELD_PREP(MT_UWTBL_DW, _dw))
++#define MT_UWTBL_DW3_PN_HI			GENMASK(15, 0)
++
+ /* AGG: band 0(0x820e2000), band 1(0x820f2000), band 2(0x830e2000) */
+ #define MT_WF_AGG_BASE(_band)			__BASE(WF_AGG_BASE, (_band))
+ #define MT_WF_AGG(_band, ofs)			(MT_WF_AGG_BASE(_band) + (ofs))

@@ -1,0 +1,31 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 01:50:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: restart the radar detector after a full
+ reset
+
+A full reset loads the firmware again, which then knows nothing about
+the radar detector, but the driver keeps the DFS state it had.  When
+mac80211 sets the channel again, mt7996_dfs_init_radar_detector() sees
+no state change and neither starts the detector nor ends the CAC.  On a
+DFS channel, MT7990 then sends nothing, not even beacons, until the
+interface is restarted.
+
+Forget the DFS state on a full reset.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mac.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+--- a/mt7996/mac.c
++++ b/mt7996/mac.c
+@@ -2523,6 +2523,8 @@ mt7996_mac_full_reset(struct mt7996_dev
+ 	mt7996_for_each_phy(dev, phy) {
+ 		phy->omac_mask = 0;
+ 		phy->rxfilter |= MT_WF_RFCR_DROP_OTHER_UC;
++		/* the new firmware has to start the radar detector again */
++		phy->mt76->dfs_state = MT_DFS_STATE_UNKNOWN;
+ 	}
+ 	dev->mld_idx_mask = 0;
+ 	dev->mld_remap_idx_mask = 0;

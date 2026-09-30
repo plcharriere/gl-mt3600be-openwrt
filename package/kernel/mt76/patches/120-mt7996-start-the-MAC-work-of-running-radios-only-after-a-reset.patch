@@ -1,0 +1,33 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 02:35:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: start the MAC work of running radios only
+ after a reset
+
+mt7996_reconfig_complete() queues the MAC work of every radio, also of
+a radio without interface.  Nothing cancels it there, since
+mt7996_stop_phy() only stops running radios, and the work queues itself
+again forever.  When the driver is removed, its timer can then fire
+after the workqueue of the hardware is gone and crash the kernel.
+
+Queue the MAC work of running radios only, as mt7996_run() does.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/main.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -3117,8 +3117,9 @@ mt7996_reconfig_complete(struct ieee8021
+ 
+ 	ieee80211_wake_queues(hw);
+ 	mt7996_for_each_phy(dev, phy)
+-		ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
+-					     MT7996_WATCHDOG_TIME);
++		if (test_bit(MT76_STATE_RUNNING, &phy->mt76->state))
++			ieee80211_queue_delayed_work(hw, &phy->mt76->mac_work,
++						     MT7996_WATCHDOG_TIME);
+ }
+ 
+ static int
