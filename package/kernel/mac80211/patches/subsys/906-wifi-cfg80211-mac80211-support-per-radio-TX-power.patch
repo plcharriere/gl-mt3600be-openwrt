@@ -1,0 +1,243 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 12:48:16 +0900
+Subject: [PATCH] wifi: cfg80211/mac80211: support per-radio TX power
+
+On a wiphy with several radios, the TX power can only be set for the
+whole wiphy: nl80211 takes a radio index only for the RTS threshold, and
+mac80211 applies a TX power to every interface.  A setting meant for one
+radio then changes the others, and the last one set wins.
+
+Accept a TX power with NL80211_ATTR_WIPHY_RADIO_INDEX and keep it in the
+configuration of the radio.  mac80211 applies it to the links of that
+radio and limits every link to the TX power of its radio, also the links
+that come up later.  Without a radio index, the TX power of a wiphy with
+radios is set on every radio.
+
+A request with a radio index but without RTS threshold no longer stores
+a threshold of 0 for the radio, which mac80211 would apply after a
+hardware restart.
+
+Based-on-patch-by: Shayne Chen <shayne.chen@mediatek.com>
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mac80211/patches/subsys/0113-mtk-nl80211-support-per-radio-txpower-setting.patch
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -6200,10 +6200,16 @@ struct wiphy_iftype_akm_suites {
+  * @radio_debugfsdir: Pointer to debugfs directory containing the radio-
+  *	specific parameters.
+  *	NULL (default) = Debugfs directory not created
++ * @tx_power_setting: TX power setting of the radio;
++ *	%NL80211_TX_POWER_AUTOMATIC (default) = no limit
++ * @tx_power_level: TX power limit of the radio in mBm, unless
++ *	@tx_power_setting is %NL80211_TX_POWER_AUTOMATIC
+  */
+ struct wiphy_radio_cfg {
+ 	u32 rts_threshold;
+ 	struct dentry *radio_debugfsdir;
++	enum nl80211_tx_power_setting tx_power_setting;
++	int tx_power_level;
+ };
+ 
+ /**
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3744,6 +3744,37 @@ static int ieee80211_set_tx_power(struct
+ 		return -EINVAL;
+ 	}
+ 
++	if (radio_idx >= 0) {
++		list_for_each_entry(sdata, &local->interfaces, list) {
++			if (sdata->vif.type == NL80211_IFTYPE_MONITOR &&
++			    !ieee80211_hw_check(&local->hw, NO_VIRTUAL_MONITOR))
++				continue;
++
++			for (int link_id = 0;
++			     link_id < ARRAY_SIZE(sdata->link);
++			     link_id++) {
++				struct ieee80211_link_data *link =
++					wiphy_dereference(wiphy, sdata->link[link_id]);
++				struct ieee80211_chanctx_conf *chanctx_conf;
++
++				if (!link)
++					continue;
++
++				chanctx_conf = sdata_dereference(link->conf->chanctx_conf,
++								 sdata);
++				if (!chanctx_conf ||
++				    chanctx_conf->radio_idx != radio_idx)
++					continue;
++
++				link->user_power_level = user_power_level;
++				update_txp_type = txp_type != link->conf->txpower_type;
++				link->conf->txpower_type = txp_type;
++				ieee80211_recalc_txpower(link, update_txp_type);
++			}
++		}
++		return 0;
++	}
++
+ 	if (wdev) {
+ 		sdata = IEEE80211_WDEV_TO_SUB_IF(wdev);
+ 
+--- a/net/mac80211/iface.c
++++ b/net/mac80211/iface.c
+@@ -46,8 +46,9 @@ static void ieee80211_iface_work(struct
+ 
+ bool __ieee80211_recalc_txpower(struct ieee80211_link_data *link)
+ {
++	struct wiphy *wiphy = link->sdata->local->hw.wiphy;
+ 	struct ieee80211_chanctx_conf *chanctx_conf;
+-	int power;
++	int power, radio_idx;
+ 
+ 	rcu_read_lock();
+ 	chanctx_conf = rcu_dereference(link->conf->chanctx_conf);
+@@ -57,8 +58,16 @@ bool __ieee80211_recalc_txpower(struct i
+ 	}
+ 
+ 	power = ieee80211_chandef_max_power(&chanctx_conf->def);
++	radio_idx = chanctx_conf->radio_idx;
+ 	rcu_read_unlock();
+ 
++	if (radio_idx >= 0 && radio_idx < wiphy->n_radio) {
++		const struct wiphy_radio_cfg *rcfg = &wiphy->radio_cfg[radio_idx];
++
++		if (rcfg->tx_power_setting != NL80211_TX_POWER_AUTOMATIC)
++			power = min(power, MBM_TO_DBM(rcfg->tx_power_level));
++	}
++
+ 	if (link->user_power_level != IEEE80211_UNSET_POWER_LEVEL)
+ 		power = min(power, link->user_power_level);
+ 
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -4231,6 +4231,10 @@ static int nl80211_set_wiphy_radio(struc
+ 		changed |= WIPHY_PARAM_RTS_THRESHOLD;
+ 	}
+ 
++	/* the TX power of a radio comes without its RTS threshold */
++	if (!changed)
++		return 0;
++
+ 	old_rts = rdev->wiphy.radio_cfg[radio_idx].rts_threshold;
+ 
+ 	rdev->wiphy.radio_cfg[radio_idx].rts_threshold = rts_threshold;
+@@ -4242,6 +4246,71 @@ static int nl80211_set_wiphy_radio(struc
+ 	return 0;
+ }
+ 
++static int nl80211_set_radio_tx_power(struct cfg80211_registered_device *rdev,
++				      int radio_idx,
++				      enum nl80211_tx_power_setting type,
++				      int mbm)
++{
++	struct wiphy_radio_cfg *rcfg = &rdev->wiphy.radio_cfg[radio_idx];
++	enum nl80211_tx_power_setting old_type = rcfg->tx_power_setting;
++	int old_mbm = rcfg->tx_power_level;
++	int result;
++
++	rcfg->tx_power_setting = type;
++	rcfg->tx_power_level = mbm;
++
++	result = rdev_set_tx_power(rdev, NULL, radio_idx, type, mbm);
++	if (result) {
++		rcfg->tx_power_setting = old_type;
++		rcfg->tx_power_level = old_mbm;
++	}
++
++	return result;
++}
++
++static int nl80211_set_tx_power(struct genl_info *info,
++				struct cfg80211_registered_device *rdev,
++				struct wireless_dev *wdev, int radio_idx)
++{
++	struct wireless_dev *txp_wdev = wdev;
++	enum nl80211_tx_power_setting type;
++	int idx, mbm = 0, i, result;
++
++	if (!(rdev->wiphy.features & NL80211_FEATURE_VIF_TXPOWER))
++		txp_wdev = NULL;
++
++	if (!rdev->ops->set_tx_power)
++		return -EOPNOTSUPP;
++
++	idx = NL80211_ATTR_WIPHY_TX_POWER_SETTING;
++	type = nla_get_u32(info->attrs[idx]);
++
++	if (!info->attrs[NL80211_ATTR_WIPHY_TX_POWER_LEVEL] &&
++	    type != NL80211_TX_POWER_AUTOMATIC)
++		return -EINVAL;
++
++	if (type != NL80211_TX_POWER_AUTOMATIC) {
++		idx = NL80211_ATTR_WIPHY_TX_POWER_LEVEL;
++		mbm = nla_get_u32(info->attrs[idx]);
++	}
++
++	if (radio_idx >= 0)
++		return nl80211_set_radio_tx_power(rdev, radio_idx, type, mbm);
++
++	/* without a radio index, set the TX power of every radio */
++	if (!txp_wdev && rdev->wiphy.n_radio) {
++		for (i = 0; i < rdev->wiphy.n_radio; i++) {
++			result = nl80211_set_radio_tx_power(rdev, i, type, mbm);
++			if (result)
++				return result;
++		}
++
++		return 0;
++	}
++
++	return rdev_set_tx_power(rdev, txp_wdev, -1, type, mbm);
++}
++
+ static int nl80211_set_wiphy(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = NULL;
+@@ -4315,7 +4384,11 @@ static int nl80211_set_wiphy(struct sk_b
+ 		if (radio_idx >= rdev->wiphy.n_radio)
+ 			return -EINVAL;
+ 
+-		return nl80211_set_wiphy_radio(info, rdev, radio_idx);
++		result = nl80211_set_wiphy_radio(info, rdev, radio_idx);
++		if (result || !info->attrs[NL80211_ATTR_WIPHY_TX_POWER_SETTING])
++			return result;
++
++		return nl80211_set_tx_power(info, rdev, NULL, radio_idx);
+ 	}
+ 
+ 	if (info->attrs[NL80211_ATTR_WIPHY_TXQ_PARAMS]) {
+@@ -4385,30 +4458,7 @@ static int nl80211_set_wiphy(struct sk_b
+ 	}
+ 
+ 	if (info->attrs[NL80211_ATTR_WIPHY_TX_POWER_SETTING]) {
+-		struct wireless_dev *txp_wdev = wdev;
+-		enum nl80211_tx_power_setting type;
+-		int idx, mbm = 0;
+-
+-		if (!(rdev->wiphy.features & NL80211_FEATURE_VIF_TXPOWER))
+-			txp_wdev = NULL;
+-
+-		if (!rdev->ops->set_tx_power)
+-			return -EOPNOTSUPP;
+-
+-		idx = NL80211_ATTR_WIPHY_TX_POWER_SETTING;
+-		type = nla_get_u32(info->attrs[idx]);
+-
+-		if (!info->attrs[NL80211_ATTR_WIPHY_TX_POWER_LEVEL] &&
+-		    (type != NL80211_TX_POWER_AUTOMATIC))
+-			return -EINVAL;
+-
+-		if (type != NL80211_TX_POWER_AUTOMATIC) {
+-			idx = NL80211_ATTR_WIPHY_TX_POWER_LEVEL;
+-			mbm = nla_get_u32(info->attrs[idx]);
+-		}
+-
+-		result = rdev_set_tx_power(rdev, txp_wdev, radio_idx, type,
+-					   mbm);
++		result = nl80211_set_tx_power(info, rdev, wdev, radio_idx);
+ 		if (result)
+ 			return result;
+ 	}
