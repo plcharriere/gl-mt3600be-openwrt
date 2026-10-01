@@ -1,0 +1,88 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 13:20:09 +0900
+Subject: [PATCH] iw: allow setting the coverage class of a radio
+
+Take an optional radio index in "iw phy <phy> set coverage" and
+"iw phy <phy> set distance", as "set rts" does.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/phy.c
++++ b/phy.c
+@@ -624,6 +624,29 @@ COMMAND(set, netns, "{ <pid> | name <nsn
+ 	"    <nsname> - change network namespace by name from "NETNS_RUN_DIR"\n"
+ 	"               or by absolute path (man ip-netns)\n");
+ 
++/* put the radio index of "radio <radio index>", if given */
++static int put_radio_idx(struct nl_msg *msg, int argc, char **argv)
++{
++	unsigned long radio_idx;
++	char *end;
++
++	if (!argc)
++		return 0;
++
++	if (argc != 2 || strcmp("radio", argv[0]) != 0)
++		return 1;
++
++	radio_idx = strtoul(argv[1], &end, 10);
++	if (!*argv[1] || *end || radio_idx > 255)
++		return 1;
++
++	NLA_PUT_U8(msg, NL80211_ATTR_WIPHY_RADIO_INDEX, radio_idx);
++
++	return 0;
++ nla_put_failure:
++	return -ENOBUFS;
++}
++
+ static int handle_coverage(struct nl80211_state *state,
+ 			struct nl_msg *msg,
+ 			int argc, char **argv,
+@@ -632,7 +655,7 @@ static int handle_coverage(struct nl8021
+ 	char *end;
+ 	unsigned int coverage;
+ 
+-	if (argc != 1)
++	if (argc != 1 && argc != 3)
+ 		return 1;
+ 
+ 	if (!*argv[0])
+@@ -646,11 +669,11 @@ static int handle_coverage(struct nl8021
+ 
+ 	NLA_PUT_U8(msg, NL80211_ATTR_WIPHY_COVERAGE_CLASS, coverage);
+ 
+-	return 0;
++	return put_radio_idx(msg, argc - 1, argv + 1);
+  nla_put_failure:
+ 	return -ENOBUFS;
+ }
+-COMMAND(set, coverage, "<coverage class>",
++COMMAND(set, coverage, "<coverage class> [radio <radio index>]",
+ 	NL80211_CMD_SET_WIPHY, 0, CIB_PHY, handle_coverage,
+ 	"Set coverage class (1 for every 3 usec of air propagation time).\n"
+ 	"Valid values: 0 - 255.");
+@@ -660,7 +683,7 @@ static int handle_distance(struct nl8021
+ 			int argc, char **argv,
+ 			enum id_input id)
+ {
+-	if (argc != 1)
++	if (argc != 1 && argc != 3)
+ 		return 1;
+ 
+ 	if (!*argv[0])
+@@ -691,11 +714,11 @@ static int handle_distance(struct nl8021
+ 		NLA_PUT_U8(msg, NL80211_ATTR_WIPHY_COVERAGE_CLASS, coverage);
+ 	}
+ 
+-	return 0;
++	return put_radio_idx(msg, argc - 1, argv + 1);
+  nla_put_failure:
+ 	return -ENOBUFS;
+ }
+-COMMAND(set, distance, "<auto|distance>",
++COMMAND(set, distance, "<auto|distance> [radio <radio index>]",
+ 	NL80211_CMD_SET_WIPHY, 0, CIB_PHY, handle_distance,
+ 	"Enable ACK timeout estimation algorithm (dynack) or set appropriate\n"
+ 	"coverage class for given link distance in meters.\n"
