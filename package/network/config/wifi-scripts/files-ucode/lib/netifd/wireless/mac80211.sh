@@ -106,7 +106,7 @@ function setup_phy(phy, config, data) {
 		system(`iw phy ${phy} set antenna ${config.txantenna} ${config.rxantenna} >/dev/null 2>&1`);
 	}
 	system(`iw phy ${phy} set distance ${config.distance} >/dev/null 2>&1`);
-	system(`iw phy ${phy} set txpower ${config.txpower}`);
+	system(`iw phy ${phy} set txpower ${config.txpower}${phy_suffix(config.radio, ' radio ')}`);
 
 	if (config.frag)
 		system(`iw phy ${phy} set frag ${config.frag}`);
