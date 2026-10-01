@@ -1,0 +1,58 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 13:28:12 +0900
+Subject: [PATCH] wifi: mt76: mt7996: apply the RTS threshold and coverage class
+ when a radio starts
+
+mt7996_run() sends an RTS threshold of 0x92b whatever is configured, and
+the coverage class is only written to a radio that is running.  An RTS
+threshold or a coverage class set while a radio is stopped is then lost
+when it starts.
+
+Send the configured RTS threshold, or 0x92b without one, and write the
+coverage class of the radio when it starts.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -7,6 +7,20 @@
+ #include "mcu.h"
+ #include "mac.h"
+ 
++static u32 mt7996_rts_threshold(struct mt7996_phy *phy)
++{
++	struct wiphy *wiphy = phy->mt76->hw->wiphy;
++	u32 val = wiphy->rts_threshold;
++	int i;
++
++	for (i = 0; i < wiphy->n_radio; i++)
++		if (phy->dev->radio_phy[i] == phy)
++			val = wiphy->radio_cfg[i].rts_threshold;
++
++	/* without a configured threshold, keep the default one */
++	return val == (u32)-1 ? 0x92b : val;
++}
++
+ int mt7996_run(struct mt7996_phy *phy)
+ {
+ 	struct mt7996_dev *dev = phy->dev;
+@@ -14,7 +28,7 @@ int mt7996_run(struct mt7996_phy *phy)
+ 
+ 	mt7996_mac_enable_nf(dev, phy->mt76->band_idx);
+ 
+-	ret = mt7996_mcu_set_rts_thresh(phy, 0x92b);
++	ret = mt7996_mcu_set_rts_thresh(phy, mt7996_rts_threshold(phy));
+ 	if (ret)
+ 		return ret;
+ 
+@@ -41,6 +55,9 @@ int mt7996_run(struct mt7996_phy *phy)
+ 
+ 	set_bit(MT76_STATE_RUNNING, &phy->mt76->state);
+ 
++	/* a coverage class set while the radio was stopped is not set yet */
++	mt7996_mac_set_coverage_class(phy);
++
+ 	ieee80211_queue_delayed_work(dev->mphy.hw, &phy->mt76->mac_work,
+ 				     MT7996_WATCHDOG_TIME);
+ 
