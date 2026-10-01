@@ -1,0 +1,52 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 16:04:53 +0900
+Subject: [PATCH] wifi: mt76: keep power save buffering for nullfunc probes
+
+Nullfunc frames from the pending path go to the PSD queue, which
+transmits at once, without power save buffering. A nullfunc frame that
+probes a station (NL80211_CMD_PROBE_CLIENT, which hostapd uses to check
+an inactive station) is then sent while the station sleeps: it is not
+acknowledged, and hostapd disconnects the station.
+
+Send a nullfunc frame to the PSD queue only when mac80211 marked it as
+not to be buffered (IEEE80211_TX_CTL_NO_PS_BUFFER), as it does for the
+response to a station in power save.
+
+Fixes: da6d90e4f66a ("wifi: mt76: route nullfunc frames to PSD/ALTX queue")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/tx.c
++++ b/tx.c
+@@ -685,6 +685,22 @@ void mt76_txq_schedule(struct mt76_phy *
+ }
+ EXPORT_SYMBOL_GPL(mt76_txq_schedule);
+ 
++static bool
++mt76_tx_skip_ps_buffer(struct sk_buff *skb)
++{
++	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
++
++	/*
++	 * A nullfunc frame that answers a station in power save must go out
++	 * at once; one that probes a station waits until the station is
++	 * awake, as any other data frame.
++	 */
++	if (ieee80211_is_data(hdr->frame_control))
++		return IEEE80211_SKB_CB(skb)->flags & IEEE80211_TX_CTL_NO_PS_BUFFER;
++
++	return !ieee80211_is_bufferable_mmpdu(skb);
++}
++
+ static int
+ mt76_txq_schedule_pending_wcid(struct mt76_phy *phy, struct mt76_wcid *wcid,
+ 			       struct sk_buff_head *head)
+@@ -705,7 +721,7 @@ mt76_txq_schedule_pending_wcid(struct mt
+ 		    !(info->flags & IEEE80211_TX_CTL_HW_80211_ENCAP) &&
+ 		    !ieee80211_is_data_present(hdr->frame_control) &&
+ 		    (!(wcid->tx_info & MT_WCID_TX_INFO_SET) ||
+-		     !ieee80211_is_bufferable_mmpdu(skb) ||
++		     mt76_tx_skip_ps_buffer(skb) ||
+ 		     ieee80211_is_deauth(hdr->frame_control) ||
+ 		     ieee80211_is_disassoc(hdr->frame_control) ||
+ 		     head == &wcid->tx_offchannel))
