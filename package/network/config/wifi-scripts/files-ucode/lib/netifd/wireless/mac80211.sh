@@ -100,18 +100,21 @@ function setup_phy(phy, config, data) {
 	else
 		config.txpower = 'auto';
 
+	// on a phy with radios, these apply to the radio only
+	let radio = phy_suffix(config.radio, ' radio ');
+
 	log(`Configuring '${phy}' distance: ${config.distance}`);
 	if (antenna_changed) {
 		log(`Setting antenna for '${phy}' txantenna: ${config.txantenna}, rxantenna: ${config.rxantenna}`);
-		system(`iw phy ${phy} set antenna ${config.txantenna} ${config.rxantenna} >/dev/null 2>&1`);
+		system(`iw phy ${phy} set antenna ${config.txantenna} ${config.rxantenna}${radio} >/dev/null 2>&1`);
 	}
-	system(`iw phy ${phy} set distance ${config.distance} >/dev/null 2>&1`);
-	system(`iw phy ${phy} set txpower ${config.txpower}${phy_suffix(config.radio, ' radio ')}`);
+	system(`iw phy ${phy} set distance ${config.distance}${radio} >/dev/null 2>&1`);
+	system(`iw phy ${phy} set txpower ${config.txpower}${radio}`);
 
 	if (config.frag)
 		system(`iw phy ${phy} set frag ${config.frag}`);
 	if (config.rts)
-		system(`iw phy ${phy} set rts ${config.rts}`);
+		system(`iw phy ${phy} set rts ${config.rts}${radio}`);
 }
 
 function iw_htmode(config) {
