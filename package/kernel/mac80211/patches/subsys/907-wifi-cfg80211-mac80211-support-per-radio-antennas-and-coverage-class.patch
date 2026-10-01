@@ -1,0 +1,274 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 13:16:48 +0900
+Subject: [PATCH] wifi: cfg80211/mac80211: support per-radio antennas and
+ coverage class
+
+On a wiphy with several radios, the antennas and the coverage class can
+only be set for the whole wiphy: the antennas only while no interface is
+up, and the coverage class set for one radio replaces the one of the
+others.
+
+Accept both with NL80211_ATTR_WIPHY_RADIO_INDEX.  The antennas of a radio
+are counted from its first antenna and can change while the radio has no
+channel context.  The coverage class of a radio is kept in its
+configuration, passed with the radio index and set again after a
+hardware restart; setting the one of the wiphy applies it to all radios
+again.
+
+Based-on-patch-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/22213a321b6dafb2a5e01def97363420e6e938fd/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mac80211/patches/subsys/0123-mtk-mac80211-allow-setting-antenna-with-radio_idx.patch
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -6204,12 +6204,17 @@ struct wiphy_iftype_akm_suites {
+  *	%NL80211_TX_POWER_AUTOMATIC (default) = no limit
+  * @tx_power_level: TX power limit of the radio in mBm, unless
+  *	@tx_power_setting is %NL80211_TX_POWER_AUTOMATIC
++ * @coverage_class: coverage class of the radio, if @coverage_class_set
++ * @coverage_class_set: the radio has its own coverage class; if not, the
++ *	one of the wiphy applies
+  */
+ struct wiphy_radio_cfg {
+ 	u32 rts_threshold;
+ 	struct dentry *radio_debugfsdir;
+ 	enum nl80211_tx_power_setting tx_power_setting;
+ 	int tx_power_level;
++	u8 coverage_class;
++	bool coverage_class_set;
+ };
+ 
+ /**
+--- a/net/mac80211/cfg.c
++++ b/net/mac80211/cfg.c
+@@ -3668,8 +3668,13 @@ static int ieee80211_set_wiphy_params(st
+ 	    (changed & WIPHY_PARAM_DYN_ACK)) {
+ 		s16 coverage_class;
+ 
+-		coverage_class = changed & WIPHY_PARAM_COVERAGE_CLASS ?
+-					wiphy->coverage_class : -1;
++		if (!(changed & WIPHY_PARAM_COVERAGE_CLASS))
++			coverage_class = -1;
++		else if (radio_idx >= 0 && radio_idx < wiphy->n_radio)
++			coverage_class =
++				wiphy->radio_cfg[radio_idx].coverage_class;
++		else
++			coverage_class = wiphy->coverage_class;
+ 		err = drv_set_coverage_class(local, radio_idx,
+ 					     coverage_class);
+ 
+@@ -4960,10 +4965,21 @@ static int ieee80211_set_antenna(struct
+ 	struct ieee80211_local *local = wiphy_priv(wiphy);
+ 	int ret;
+ 
++	if (radio_idx >= 0) {
++		struct ieee80211_chanctx *ctx;
++
++		/* the antennas of a radio can change while it is not used */
++		list_for_each_entry(ctx, &local->chanctx_list, list)
++			if (ctx->conf.radio_idx == radio_idx)
++				return -EBUSY;
++
++		return drv_set_antenna(local, radio_idx, tx_ant, rx_ant);
++	}
++
+ 	if (local->started)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = drv_set_antenna(local, tx_ant, rx_ant);
++	ret = drv_set_antenna(local, -1, tx_ant, rx_ant);
+ 	if (ret)
+ 		return ret;
+ 
+--- a/net/mac80211/driver-ops.h
++++ b/net/mac80211/driver-ops.h
+@@ -769,15 +769,16 @@ static inline void drv_channel_switch(st
+ }
+ 
+ 
+-static inline int drv_set_antenna(struct ieee80211_local *local,
++static inline int drv_set_antenna(struct ieee80211_local *local, int radio_idx,
+ 				  u32 tx_ant, u32 rx_ant)
+ {
+ 	int ret = -EOPNOTSUPP;
+ 	might_sleep();
+ 	lockdep_assert_wiphy(local->hw.wiphy);
+ 	if (local->ops->set_antenna)
+-		ret = local->ops->set_antenna(&local->hw, -1, tx_ant, rx_ant);
+-	trace_drv_set_antenna(local, tx_ant, rx_ant, ret);
++		ret = local->ops->set_antenna(&local->hw, radio_idx, tx_ant,
++					      rx_ant);
++	trace_drv_set_antenna(local, radio_idx, tx_ant, rx_ant, ret);
+ 	return ret;
+ }
+ 
+--- a/net/mac80211/trace.h
++++ b/net/mac80211/trace.h
+@@ -1327,12 +1327,14 @@ DEFINE_EVENT(chanswitch_evt, drv_channel
+ );
+ 
+ TRACE_EVENT(drv_set_antenna,
+-	TP_PROTO(struct ieee80211_local *local, u32 tx_ant, u32 rx_ant, int ret),
++	TP_PROTO(struct ieee80211_local *local, int radio_idx, u32 tx_ant,
++		 u32 rx_ant, int ret),
+ 
+-	TP_ARGS(local, tx_ant, rx_ant, ret),
++	TP_ARGS(local, radio_idx, tx_ant, rx_ant, ret),
+ 
+ 	TP_STRUCT__entry(
+ 		LOCAL_ENTRY
++		__field(int, radio_idx)
+ 		__field(u32, tx_ant)
+ 		__field(u32, rx_ant)
+ 		__field(int, ret)
+@@ -1340,14 +1342,16 @@ TRACE_EVENT(drv_set_antenna,
+ 
+ 	TP_fast_assign(
+ 		LOCAL_ASSIGN;
++		__entry->radio_idx = radio_idx;
+ 		__entry->tx_ant = tx_ant;
+ 		__entry->rx_ant = rx_ant;
+ 		__entry->ret = ret;
+ 	),
+ 
+ 	TP_printk(
+-		LOCAL_PR_FMT " tx_ant:%d rx_ant:%d ret:%d",
+-		LOCAL_PR_ARG, __entry->tx_ant, __entry->rx_ant, __entry->ret
++		LOCAL_PR_FMT " radio_idx:%d tx_ant:%d rx_ant:%d ret:%d",
++		LOCAL_PR_ARG, __entry->radio_idx, __entry->tx_ant,
++		__entry->rx_ant, __entry->ret
+ 	)
+ );
+ 
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -1981,6 +1981,12 @@ int ieee80211_reconfig(struct ieee80211_
+ 
+ 	/* reset coverage class */
+ 	drv_set_coverage_class(local, -1, hw->wiphy->coverage_class);
++	for (i = 0; i < hw->wiphy->n_radio; i++) {
++		const struct wiphy_radio_cfg *rcfg = &hw->wiphy->radio_cfg[i];
++
++		if (rcfg->coverage_class_set)
++			drv_set_coverage_class(local, i, rcfg->coverage_class);
++	}
+ 
+ 	ieee80211_led_radio(local, true);
+ 	ieee80211_mod_tpt_led_trig(local,
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -4215,33 +4215,80 @@ static int nl80211_set_channel(struct sk
+ 	return __nl80211_set_channel(rdev, netdev, info, link_id);
+ }
+ 
++static int nl80211_set_radio_antenna(struct genl_info *info,
++				     struct cfg80211_registered_device *rdev,
++				     int radio_idx)
++{
++	const struct wiphy_radio *radio = &rdev->wiphy.radio[radio_idx];
++	u32 tx_ant, rx_ant, mask;
++
++	if (!radio->antenna_mask || !rdev->ops->set_antenna)
++		return -EOPNOTSUPP;
++
++	/* the antennas of a radio are counted from its first one */
++	mask = radio->antenna_mask >> __ffs(radio->antenna_mask);
++	tx_ant = nla_get_u32(info->attrs[NL80211_ATTR_WIPHY_ANTENNA_TX]);
++	rx_ant = nla_get_u32(info->attrs[NL80211_ATTR_WIPHY_ANTENNA_RX]);
++
++	/* reject antennas the radio does not have, except the "all" mask */
++	if ((~tx_ant && (tx_ant & ~mask)) || (~rx_ant && (rx_ant & ~mask)))
++		return -EINVAL;
++
++	return rdev_set_antenna(rdev, radio_idx, tx_ant & mask, rx_ant & mask);
++}
++
+ static int nl80211_set_wiphy_radio(struct genl_info *info,
+ 				   struct cfg80211_registered_device *rdev,
+ 				   int radio_idx)
+ {
++	struct wiphy_radio_cfg *rcfg = &rdev->wiphy.radio_cfg[radio_idx];
+ 	u32 rts_threshold = 0, old_rts, changed = 0;
++	u8 coverage_class = 0, old_coverage_class;
++	bool old_coverage_class_set;
+ 	int result;
+ 
+ 	if (!rdev->ops->set_wiphy_params)
+ 		return -EOPNOTSUPP;
+ 
++	if (info->attrs[NL80211_ATTR_WIPHY_DYN_ACK])
++		return -EOPNOTSUPP;
++
+ 	if (info->attrs[NL80211_ATTR_WIPHY_RTS_THRESHOLD]) {
+ 		rts_threshold = nla_get_u32(
+ 				info->attrs[NL80211_ATTR_WIPHY_RTS_THRESHOLD]);
+ 		changed |= WIPHY_PARAM_RTS_THRESHOLD;
+ 	}
+ 
+-	/* the TX power of a radio comes without its RTS threshold */
+-	if (!changed)
+-		return 0;
++	if (info->attrs[NL80211_ATTR_WIPHY_COVERAGE_CLASS]) {
++		coverage_class =
++			nla_get_u8(info->attrs[NL80211_ATTR_WIPHY_COVERAGE_CLASS]);
++		changed |= WIPHY_PARAM_COVERAGE_CLASS;
++	}
+ 
+-	old_rts = rdev->wiphy.radio_cfg[radio_idx].rts_threshold;
++	if (changed) {
++		old_rts = rcfg->rts_threshold;
++		old_coverage_class = rcfg->coverage_class;
++		old_coverage_class_set = rcfg->coverage_class_set;
++
++		if (changed & WIPHY_PARAM_RTS_THRESHOLD)
++			rcfg->rts_threshold = rts_threshold;
++		if (changed & WIPHY_PARAM_COVERAGE_CLASS) {
++			rcfg->coverage_class = coverage_class;
++			rcfg->coverage_class_set = true;
++		}
+ 
+-	rdev->wiphy.radio_cfg[radio_idx].rts_threshold = rts_threshold;
++		result = rdev_set_wiphy_params(rdev, radio_idx, changed);
++		if (result) {
++			rcfg->rts_threshold = old_rts;
++			rcfg->coverage_class = old_coverage_class;
++			rcfg->coverage_class_set = old_coverage_class_set;
++			return result;
++		}
++	}
+ 
+-	result = rdev_set_wiphy_params(rdev, radio_idx, changed);
+-	if (result)
+-		rdev->wiphy.radio_cfg[radio_idx].rts_threshold = old_rts;
++	if (info->attrs[NL80211_ATTR_WIPHY_ANTENNA_TX] &&
++	    info->attrs[NL80211_ATTR_WIPHY_ANTENNA_RX])
++		return nl80211_set_radio_antenna(info, rdev, radio_idx);
+ 
+ 	return 0;
+ }
+@@ -4645,6 +4692,13 @@ static int nl80211_set_wiphy(struct sk_b
+ 			rdev->wiphy.txq_limit = old_txq_limit;
+ 			rdev->wiphy.txq_memory_limit = old_txq_memory_limit;
+ 			rdev->wiphy.txq_quantum = old_txq_quantum;
++		} else if (changed & WIPHY_PARAM_COVERAGE_CLASS) {
++			/* the coverage class of the wiphy now applies to all
++			 * its radios
++			 */
++			for (i = 0; i < rdev->wiphy.n_radio; i++)
++				rdev->wiphy.radio_cfg[i].coverage_class_set =
++					false;
+ 		}
+ 
+ 		kfree(old_radio_rts_threshold);
+--- a/net/wireless/rdev-ops.h
++++ b/net/wireless/rdev-ops.h
+@@ -867,7 +867,7 @@ static inline int rdev_set_antenna(struc
+ {
+ 	int ret;
+ 	trace_rdev_set_antenna(&rdev->wiphy, radio_idx, tx_ant, rx_ant);
+-	ret = rdev->ops->set_antenna(&rdev->wiphy, -1, tx_ant, rx_ant);
++	ret = rdev->ops->set_antenna(&rdev->wiphy, radio_idx, tx_ant, rx_ant);
+ 	trace_rdev_return_int(&rdev->wiphy, ret);
+ 	return ret;
+ }
