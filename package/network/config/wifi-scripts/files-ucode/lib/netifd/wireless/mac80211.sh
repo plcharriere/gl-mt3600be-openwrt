@@ -113,8 +113,8 @@ function setup_phy(phy, config, data) {
 
 	if (config.frag)
 		system(`iw phy ${phy} set frag ${config.frag}`);
-	if (config.rts)
-		system(`iw phy ${phy} set rts ${config.rts}${radio}`);
+	// RTS off without the option, so that removing it takes effect
+	system(`iw phy ${phy} set rts ${config.rts || 'off'}${radio}`);
 }
 
 function iw_htmode(config) {
