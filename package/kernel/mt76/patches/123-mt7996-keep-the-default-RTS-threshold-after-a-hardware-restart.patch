@@ -1,0 +1,43 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 1 Oct 2026 14:38:31 +0900
+Subject: [PATCH] wifi: mt76: mt7996: keep the default RTS threshold after a
+ hardware restart
+
+A radio without a configured RTS threshold starts with a threshold of
+0x92b.  After a hardware restart, mac80211 sets the RTS threshold of
+every radio again, which is -1 (off) for such a radio, and the firmware
+gets 0xffffffff: RTS by frame length stays off until the radio starts
+again.
+
+Send 0x92b for a threshold of -1 in mt7996_mcu_set_rts_thresh(), so a
+radio keeps the threshold it started with.  Turning RTS off while a
+radio runs now also gives 0x92b, as turning it off before the radio
+starts already did.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -17,8 +17,7 @@ static u32 mt7996_rts_threshold(struct m
+ 		if (phy->dev->radio_phy[i] == phy)
+ 			val = wiphy->radio_cfg[i].rts_threshold;
+ 
+-	/* without a configured threshold, keep the default one */
+-	return val == (u32)-1 ? 0x92b : val;
++	return val;
+ }
+ 
+ int mt7996_run(struct mt7996_phy *phy)
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -5558,7 +5558,8 @@ int mt7996_mcu_set_rts_thresh(struct mt7
+ 		.band_idx = phy->mt76->band_idx,
+ 		.tag = cpu_to_le16(UNI_BAND_CONFIG_RTS_THRESHOLD),
+ 		.len = cpu_to_le16(sizeof(req) - 4),
+-		.len_thresh = cpu_to_le32(val),
++		/* RTS off (-1) gets the default threshold */
++		.len_thresh = cpu_to_le32(val == (u32)-1 ? 0x92b : val),
+ 		.pkt_thresh = cpu_to_le32(0x2),
+ 	};
+ 
