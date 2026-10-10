@@ -545,8 +545,8 @@ function generate(config) {
 	/* TX Power */
 	append_vars(config, [ 'min_tx_power' ]);
 
-	/* hwmode, channel, op_class, ... */
-	append_vars(config, [ 'hw_mode', 'channel', 'rts_threshold', 'chanlist' ]);
+	/* hwmode, channel, op_class, ...; mac80211.sh sets rts_threshold */
+	append_vars(config, [ 'hw_mode', 'channel', 'chanlist' ]);
 	if (config.hw_mode in [ 'a', 'g' ] && config.require_mode in [ 'n', 'ac', 'ax' ]) {
 		let require_mode = { n: 'require_ht', ac: 'require_vht', ax: 'require_he' };
 

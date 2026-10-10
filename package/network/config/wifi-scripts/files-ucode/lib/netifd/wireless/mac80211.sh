@@ -113,8 +113,14 @@ function setup_phy(phy, config, data) {
 
 	if (config.frag)
 		system(`iw phy ${phy} set frag ${config.frag}`);
-	// RTS off without the option, so that removing it takes effect
-	system(`iw phy ${phy} set rts ${config.rts || 'off'}${radio}`);
+	// RTS off without the option, so that removing it takes effect;
+	// rts_threshold is set here, not by hostapd, which would set it for
+	// all radios of a phy with radios; -1 and 2347 or more mean off
+	let rts = config.rts || null;
+	if (rts == null && config.rts_threshold != null &&
+	    config.rts_threshold >= 0 && config.rts_threshold < 2347)
+		rts = config.rts_threshold;
+	system(`iw phy ${phy} set rts ${rts ?? 'off'}${radio}`);
 }
 
 function iw_htmode(config) {
