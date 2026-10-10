@@ -1,0 +1,25 @@
+From: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Date: Thu, 18 Sep 2025 16:33:36 +0800
+Subject: [PATCH] net: pcs: mtk-lynxi: correct power down setting
+
+Without this patch, the SGMII may not power down correctly.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/08196fa6e5d338ce88aa0002f781e2d24289b1f1/25.12/files/target/linux/mediatek/patches-6.12/999-pcs-05-mtk-lynxi-correct-power-down-setting.patch
+Signed-off-by: Bo-Cun Chen <bc-bocun.chen@mediatek.com>
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/pcs/pcs-mtk-lynxi.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+--- a/drivers/net/pcs/pcs-mtk-lynxi.c
++++ b/drivers/net/pcs/pcs-mtk-lynxi.c
+@@ -72,7 +72,7 @@
+ 
+ /* Register to power up QPHY */
+ #define SGMSYS_QPHY_PWR_STATE_CTRL	0xe8
+-#define	SGMII_PHYA_PWD			BIT(4)
++#define	SGMII_PHYA_PWD			(BIT(4) | BIT(3) | BIT(0))
+ 
+ /* Register to QPHY wrapper control */
+ #define SGMSYS_QPHY_WRAP_CTRL		0xec
