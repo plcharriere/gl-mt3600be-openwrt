@@ -1,0 +1,36 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sun, 11 Oct 2026 05:30:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: report radar on the channel context of
+ its radio
+
+mt7996 reports a radar detection with ieee80211_radar_detected(hw,
+NULL), and mac80211 then marks every channel context of the wiphy as
+radar-detected. The radios of a multi-radio wiphy share one hw, so a
+radar seen by one radio is also reported for the channels of the
+others, and hostapd handles a radar event on each of them.
+
+Pass the channel context of the radio whose detector fired.
+
+Fixes: 69d54ce7491d ("wifi: mt76: mt7996: switch to single multi-radio wiphy")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -571,9 +571,15 @@
+ 						GFP_ATOMIC);
+ 	} else {
+ 		struct mt7996_phy *phy = mphy->priv;
++		struct ieee80211_chanctx_conf *ctx = NULL;
++
++		/* only the channel context of this radio saw the radar */
++		if (mphy->chanctx)
++			ctx = container_of((void *)mphy->chanctx,
++					   struct ieee80211_chanctx_conf, drv_priv);
+ 
+ 		phy->rdd_tx_paused = true;
+-		ieee80211_radar_detected(mphy->hw, NULL);
++		ieee80211_radar_detected(mphy->hw, ctx);
+ 	}
+ 	dev->hw_pattern++;
+ 
