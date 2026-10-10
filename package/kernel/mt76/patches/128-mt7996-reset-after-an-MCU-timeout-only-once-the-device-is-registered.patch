@@ -1,0 +1,32 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sun, 11 Oct 2026 03:00:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: reset after an MCU timeout only once the
+ device is registered
+
+A message timeout queues a full chip reset. During probe, a timeout of a
+firmware download or init command queues it for a device that mac80211
+has not registered and that the probe error path is tearing down, and
+the reset work then runs on freed or half-initialized state.
+
+mt7996_reset() already ignores requests until hw_init_done is set; do
+the same for the reset on a message timeout.
+
+Fixes: d2b860454ea2 ("wifi: mt76: mt7996: reset device after MCU message timeout")
+Link: https://github.com/openwrt/mt76/issues/1147
+Link: https://github.com/openwrt/mt76/issues/1148
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -231,7 +231,9 @@ mt7996_mcu_parse_response(struct mt76_de
+ 		dev_err(mdev->dev, "Message %08x (seq %d) timeout\n",
+ 			cmd, seq);
+ 
+-		if (!test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
++		/* a full reset needs a registered device */
++		if (dev->recovery.hw_init_done &&
++		    !test_and_set_bit(MT76_MCU_RESET, &dev->mphy.state)) {
+ 			dev->recovery.restart = true;
+ 			wake_up(&dev->mt76.mcu.wait);
+ 			queue_work(dev->mt76.wq, &dev->reset_work);
