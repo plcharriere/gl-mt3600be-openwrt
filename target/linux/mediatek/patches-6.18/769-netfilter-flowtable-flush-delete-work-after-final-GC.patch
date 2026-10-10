@@ -1,0 +1,76 @@
+From: Chengfeng Ye <nicoyip.dev@gmail.com>
+Date: Mon, 28 Sep 2026 00:32:48 +0800
+Subject: [PATCH] netfilter: flowtable: flush delete work after final GC
+
+nf_flow_table_free() can return while delete work still holds a pointer to
+the flowtable. Its caller can then free the flowtable before the worker
+accesses it, causing a use-after-free.
+
+nf_flow_offload_del() sets NF_FLOW_HW_DYING only after allocating the work
+item. If this GFP_ATOMIC allocation fails during the first teardown GC
+pass, the flow remains eligible for deletion in the final GC pass inside
+nf_flow_table_offload_flush_cleanup(). That pass runs after the delete
+workqueue has been flushed, so a successful retry queues work which is
+not waited for:
+
+  teardown worker                         delete worker
+  first GC: work allocation fails
+    NF_FLOW_HW_DYING remains clear
+  flush delete workqueue
+  final GC: allocation succeeds
+    queue FLOW_CLS_DESTROY work
+  destroy rhashtable
+  free flowtable
+                                          access offload->flowtable
+
+Flush the delete workqueue again after the final GC to complete this work
+before the flowtable can be freed. All flows have already been marked for
+teardown, so this GC pass only queues delete work, and the delete worker
+does not queue further offload work.
+
+KASAN reported:
+
+  BUG: KASAN: slab-use-after-free in flow_offload_work_handler+0xbe8/0xe30
+  Read of size 8 at addr ffff888109c9fd98 by task kworker/u16:3/397
+  Workqueue: nf_ft_offload_del flow_offload_work_handler
+  Call Trace:
+   flow_offload_work_handler+0xbe8/0xe30
+   process_one_work+0x63a/0x1070
+   worker_thread+0x45b/0xd10
+  Allocated by task 87:
+   nf_tables_newflowtable+0x5d0/0x22f0
+   nfnetlink_rcv_batch+0x1396/0x1d00
+  Freed by task 11:
+   kfree+0x131/0x3c0
+   nf_tables_trans_destroy_work+0xb26/0xeb0
+   process_one_work+0x63a/0x1070
+  Last potentially related work creation:
+   __queue_work+0x68e/0x1030
+   flow_offload_del+0x74c/0xad0
+   nf_flow_offload_gc_step+0x264/0x8e0
+   nf_flow_table_gc_run+0xcd/0x150
+   nf_flow_table_offload_flush_cleanup+0x5c/0x70
+   nf_flow_table_free+0x280/0x350
+   nf_tables_flowtable_destroy+0x71/0x270
+
+Fixes: c921ffe85333 ("netfilter: flowtable: Fix flushing of offloaded flows on free")
+Cc: stable@vger.kernel.org
+Assisted-by: GPT-6-Astra
+Signed-off-by: Chengfeng Ye <nicoyip.dev@gmail.com>
+Link: https://patchwork.ozlabs.org/project/netfilter-devel/patch/20260927163248.1002656-1-nicoyip.dev@gmail.com/
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ net/netfilter/nf_flow_table_offload.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -1236,6 +1236,7 @@ void nf_flow_table_offload_flush_cleanup
+ 	if (nf_flowtable_hw_offload(flowtable)) {
+ 		flush_workqueue(nf_flow_offload_del_wq);
+ 		nf_flow_table_gc_run(flowtable);
++		flush_workqueue(nf_flow_offload_del_wq);
+ 	}
+ }
+ 
