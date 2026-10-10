@@ -1,0 +1,46 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sun, 11 Oct 2026 02:30:00 +0900
+Subject: [PATCH] net: ethernet: mtk_wed: unbind the WLAN driver before the
+ Ethernet driver
+
+The WED instances belong to the Ethernet driver: mtk_wed_exit() frees
+them when the Ethernet driver is unbound.  A WLAN driver attached to one
+keeps a pointer to it in its struct mtk_wed_device, along with the rings
+and buffers it set up through it, and uses them until it detaches.
+Unbinding the Ethernet driver while a WLAN driver is attached therefore
+leads to a use-after-free.
+
+Link the WLAN device to the Ethernet device when the WLAN driver
+attaches, so that the driver core unbinds the WLAN driver first.  The
+link goes away when the WLAN driver is unbound.
+
+Fixes: b3d0d98179d6 ("net: ethernet: mtk_eth_soc: fix possible memory leak in mtk_probe()")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -2957,6 +2957,20 @@ mtk_wed_attach(struct mtk_wed_device *de
+ 		? &dev->wlan.pci_dev->dev
+ 		: &dev->wlan.platform_dev->dev;
+ 
++	/* The WED instances belong to the Ethernet driver, which frees them
++	 * when it is unbound: have the driver core unbind the WLAN driver
++	 * first.  The link goes away with the WLAN driver.
++	 */
++	if (!device_link_add(device, hw->eth->dev,
++			     DL_FLAG_AUTOREMOVE_CONSUMER)) {
++		dev_err(device, "failed to link to %s\n",
++			dev_name(hw->eth->dev));
++		hw->wed_dev = NULL;
++		module_put(THIS_MODULE);
++		ret = -ENODEV;
++		goto unlock;
++	}
++
+ 	dev->hw = hw;
+ 	dev->dev = hw->dev;
+ 	dev->irq = hw->irq;
