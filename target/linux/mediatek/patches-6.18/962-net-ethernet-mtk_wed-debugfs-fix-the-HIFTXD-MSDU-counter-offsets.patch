@@ -1,0 +1,31 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Wed, 5 Jun 2024 10:30:28 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: debugfs: fix the HIFTXD MSDU counter
+ offsets
+
+The A-MSDU engine has two sets of 13 HIFTXD fetch counters: the buffer
+counters at 0x1e90-0x1ec0 and, right after them, the MSDU counters at
+0x1ec4-0x1ef4. wed_amsdu_show() prints the MSDU counters as
+MTK_WED_MON_AMSDU_HIFTXD_FETCH_MSDU(1) to (13), but the macro adds n * 4
+to 0x1ec4, so the dump skips the first counter and reads 0x1ef8, past
+the last one.
+
+Number the counters from 1 in the macro, as its callers do.
+
+Fixes: 3f3de094e834 ("net: ethernet: mtk_wed: debugfs: add WED 3.0 debugfs entries")
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/08196fa6e5d338ce88aa0002f781e2d24289b1f1/25.12/files/target/linux/mediatek/patches-6.12/999-wed-08-extended-wed-debugfs.patch
+[plcharriere: offset fix only, with the macro argument in parentheses]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/drivers/net/ethernet/mediatek/mtk_wed_regs.h
++++ b/drivers/net/ethernet/mediatek/mtk_wed_regs.h
+@@ -825,7 +825,7 @@ struct mtk_wdma_desc {
+ #define MTK_WED_AMSDU_QMEM_TID6_QTAIL			GENMASK(27, 16)
+ #define MTK_WED_AMSDU_QMEM_TID7_QTAIL			GENMASK(11, 0)
+ 
+-#define MTK_WED_MON_AMSDU_HIFTXD_FETCH_MSDU(_n)		(0x1ec4 + (_n) * 0x4)
++#define MTK_WED_MON_AMSDU_HIFTXD_FETCH_MSDU(_n)		(0x1ec4 + ((_n) - 1) * 0x4)
+ 
+ #define MTK_WED_AMSDU_DBG_CFG				0x1fe0
+ #define MTK_WED_AMSDU_DBG_CFG_EN			BIT(18)
