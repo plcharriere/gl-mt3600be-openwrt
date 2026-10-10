@@ -1,0 +1,48 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 10 Oct 2026 14:30:00 +0900
+Subject: [PATCH] nl80211: Report probe client events to the correct BSS
+
+nl80211_client_probe_event() delivers the event to drv->ctx, which is
+the context of drv->first_bss. When several hostapd_iface instances
+share a single driver instance, as the radios of a multi-radio wiphy do
+since wpa_driver_nl80211_can_share_drv() matches on the phy name, that
+is not the BSS that probed the station. hostapd_client_poll_ok() then
+looks the station up in the wrong interface: AP-STA-POLL-OK is not
+reported, or is reported for a stale entry of the station on another
+radio, and the pending poll flag of the station is not cleared.
+
+Use bss->ctx, as commit 61280edc2e1d ("nl80211: Report unexpected frame
+events to the correct BSS") does for unexpected frame events.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -2581,7 +2581,7 @@ static void nl80211_pmksa_candidate_even
+ }
+ 
+ 
+-static void nl80211_client_probe_event(struct wpa_driver_nl80211_data *drv,
++static void nl80211_client_probe_event(struct i802_bss *bss,
+ 				       struct nlattr **tb)
+ {
+ 	union wpa_event_data data;
+@@ -2602,7 +2602,7 @@ static void nl80211_client_probe_event(s
+ 
+ 	os_memset(&data, 0, sizeof(data));
+ 	os_memcpy(data.client_poll.addr, addr, ETH_ALEN);
+-	wpa_supplicant_event(drv->ctx, EVENT_DRIVER_CLIENT_POLL_OK, &data);
++	wpa_supplicant_event(bss->ctx, EVENT_DRIVER_CLIENT_POLL_OK, &data);
+ }
+ 
+ 
+@@ -5033,7 +5033,7 @@ static void do_process_drv_event(struct
+ 		nl80211_pmksa_candidate_event(drv, tb);
+ 		break;
+ 	case NL80211_CMD_PROBE_CLIENT:
+-		nl80211_client_probe_event(drv, tb);
++		nl80211_client_probe_event(bss, tb);
+ 		break;
+ 	case NL80211_CMD_TDLS_OPER:
+ 		nl80211_tdls_oper_event(drv, tb);
