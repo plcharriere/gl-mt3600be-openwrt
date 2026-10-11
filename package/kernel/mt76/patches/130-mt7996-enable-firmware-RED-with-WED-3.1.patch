@@ -1,0 +1,173 @@
+From: Shayne Chen <shayne.chen@mediatek.com>
+Subject: [PATCH] wifi: mt76: mt7996: enable firmware RED with WED 3.1
+
+Every frame of the WED hardware path holds a TX token while it waits in
+the chip. Enable the firmware's Random Early Drop on WED 3.1 and give it
+the token pool of each source, so that the firmware drops early for a
+station that holds too many tokens instead of letting it fill the pool.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/08196fa6e5d338ce88aa0002f781e2d24289b1f1/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0054-mtk-mt76-add-debug-tools.patch
+Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+[plcharriere: RED configuration only, enabled with WED 3.1 only; give the
+WED sources the tokens WED has (wed->wlan.nbuf) instead of
+MT7996_WED_TOKEN_SIZE; convert the host source's count to little endian;
+check the allocation]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mcu.h |   3 ++
+ mt7996/mcu.c | 109 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 110 insertions(+), 2 deletions(-)
+
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -394,6 +394,7 @@
+ 	MCU_WA_PARAM_PDMA_RX = 0x04,
+ 	MCU_WA_PARAM_CPU_UTIL = 0x0b,
+ 	MCU_WA_PARAM_RED = 0x0e,
++	MCU_WA_PARAM_RED_CONFIG = 0x40,
+ 	MCU_WA_PARAM_HW_PATH_HIF_VER = 0x2f,
+ };
+ 
+@@ -998,6 +999,7 @@
+ 	UNI_VOW_FEATURE_CTRL,
+ 	UNI_VOW_RX_AT_AIRTIME_EN = 0x0b,
+ 	UNI_VOW_RX_AT_AIRTIME_CLR_EN = 0x0e,
++	UNI_VOW_RED_ENABLE = 0x18,
+ };
+ 
+ enum {
+@@ -1096,6 +1098,7 @@
+ 	UNI_CMD_SDO_QUERY,
+ 	UNI_CMD_SDO_SET_QOS_MAP = 4,
+ 	UNI_CMD_SDO_CP_MODE = 6,
++	UNI_CMD_SDO_RED_SETTING = 7,
+ };
+ 
+ enum {
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -4150,7 +4150,111 @@
+ 	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+ 				     MCU_WM_UNI_CMD(VOW), true);
+ }
++
++static int mt7996_mcu_wa_red_config(struct mt7996_dev *dev)
++{
++#define RED_TOKEN_CONFIG	2
++#define RED_TOKEN_SRC_CNT	4
++	struct mt7996_wa_params {
++		__le32 arg[3];
++	} __packed;
++	struct mt7996_red_config_hdr {
++		u8 rsv[4];
++		__le16 tag;
++		__le16 len;
++	} __packed;
++	struct mt7996_red_config {
++		u8 mode;
++		u8 version;
++		u8 _rsv[4];
++		__le16 len;
++
++		__le16 tcp_offset;
++		__le16 priority_offset;
++		__le16 token_per_src[RED_TOKEN_SRC_CNT];
++		__le16 token_thr_per_src[RED_TOKEN_SRC_CNT];
++	} __packed;
++	u16 wed_tokens = dev->mt76.mmio.wed.wlan.nbuf;
++	struct mt7996_red_config *req;
++	int ret, len = sizeof(*req);
++	void *data;
++	u8 i;
+ 
++	len += is_mt7990(&dev->mt76) ?
++	       sizeof(struct mt7996_red_config_hdr) + 1120 :
++	       sizeof(struct mt7996_wa_params) + 604;
++
++	data = kzalloc(len, GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++
++	if (is_mt7990(&dev->mt76)) {
++		struct mt7996_red_config_hdr *hdr = data;
++
++		hdr->tag = cpu_to_le16(UNI_CMD_SDO_RED_SETTING);
++		hdr->len = cpu_to_le16(len - 4);
++		req = data + sizeof(*hdr);
++		req->len = cpu_to_le16(len - sizeof(*hdr));
++	} else {
++		struct mt7996_wa_params *param = data;
++
++		param->arg[0] = cpu_to_le32(MCU_WA_PARAM_RED_CONFIG);
++		req = data + sizeof(*param);
++		req->len = cpu_to_le16(len - sizeof(*param));
++	}
++
++	req->mode = RED_TOKEN_CONFIG;
++	req->tcp_offset = cpu_to_le16(200);
++	req->priority_offset = cpu_to_le16(255);
++	for (i = 0; i < RED_TOKEN_SRC_CNT; i++) {
++		req->token_per_src[i] = cpu_to_le16(wed_tokens);
++		req->token_thr_per_src[i] = cpu_to_le16(wed_tokens);
++	}
++	req->token_per_src[RED_TOKEN_SRC_CNT - 1] =
++		cpu_to_le16(dev->mt76.token_size);
++
++	if (is_mt7990(&dev->mt76))
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_UNI_CMD(SDO), data,
++					len, false);
++	else
++		ret = mt76_mcu_send_msg(&dev->mt76, MCU_WA_PARAM_CMD(SET), data,
++					len, false);
++	kfree(data);
++
++	return ret;
++}
++
++static int mt7996_mcu_red_config(struct mt7996_dev *dev, bool enable)
++{
++#define RED_DISABLE		0
++#define RED_BY_WA_ENABLE	2
++	struct {
++		u8 __rsv1[4];
++
++		__le16 tag;
++		__le16 len;
++		u8 enable;
++		u8 __rsv2[3];
++	} __packed req = {
++		.tag = cpu_to_le16(UNI_VOW_RED_ENABLE),
++		.len = cpu_to_le16(sizeof(req) - 4),
++		.enable = enable ? RED_BY_WA_ENABLE : RED_DISABLE,
++	};
++	int ret;
++
++	ret = mt76_mcu_send_msg(&dev->mt76, MCU_WM_UNI_CMD(VOW), &req,
++				sizeof(req), true);
++	if (ret)
++		return ret;
++
++	ret = mt7996_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET), MCU_WA_PARAM_RED,
++				enable, 0);
++	if (ret || !enable)
++		return ret;
++
++	return mt7996_mcu_wa_red_config(dev);
++}
++
+ int mt7996_mcu_init_firmware(struct mt7996_dev *dev)
+ {
+ 	int ret;
+@@ -4193,8 +4297,9 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return mt7996_mcu_wa_cmd(dev, MCU_WA_PARAM_CMD(SET),
+-				 MCU_WA_PARAM_RED, 0, 0);
++	return mt7996_mcu_red_config(dev,
++		mtk_wed_device_active(&dev->mt76.mmio.wed) &&
++		dev->mt76.mmio.wed.version == MTK_WED_HW_V3_1);
+ }
+ 
+ int mt7996_mcu_init(struct mt7996_dev *dev)
