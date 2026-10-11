@@ -1,0 +1,73 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Subject: [PATCH] wifi: mt76: mt7996: use 4096 WED TX tokens with WED 3.1
+
+With 16384 WED TX tokens, the best-effort queue of a station in the
+firmware fills up to its limit under a bulk download, and the firmware
+then drops every new frame: other flows to that station, such as a call
+or a game, lose most of their packets. With 4096 tokens that queue stays
+short. Firmware RED, enabled with WED 3.1, keeps one station with a deep
+queue from holding most of the smaller pool.
+
+Use 4096 tokens with WED 3.1 and add a wed_tx_tokens module parameter to
+choose another count. Other WED versions keep 16384.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mmio.c   |  12 +++++++++++-
+ mt7996/mt7996.h |   2 ++
+ 2 files changed, 13 insertions(+), 1 deletion(-)
+
+--- a/mt7996/mmio.c
++++ b/mt7996/mmio.c
+@@ -16,6 +16,11 @@
+ 
+ static bool wed_enable;
+ module_param(wed_enable, bool, 0644);
++
++static unsigned int wed_tx_tokens;
++module_param(wed_tx_tokens, uint, 0444);
++MODULE_PARM_DESC(wed_tx_tokens,
++		 "WED TX tokens, the frames of the hardware path queued in the chip (1024-16384; default 4096 with WED 3.1, 16384 otherwise)");
+ 
+ #define INVALID_REG_ADDR	0xffffffff
+ 
+@@ -501,6 +506,7 @@
+ 	struct pci_dev *pci_dev = pdev_ptr;
+ 	u32 hif1_ofs;
+ 	u16 tx_token_size = MT7996_WED_TOKEN_SIZE;
++	u16 wed_tokens = MT7996_WED_TOKEN_SIZE;
+ 	u16 rx_token_size;
+ 	enum mt76_hwrro_mode hwrro_mode;
+ 	int wed_hw_ver;
+@@ -524,6 +530,7 @@
+ 		hwrro_mode = is_mt7996(&dev->mt76) ?
+ 			      MT76_HWRRO_V3 : MT76_HWRRO_V3_1;
+ 		rx_token_size = 24576;
++		wed_tokens = MT7996_WED_V3_1_TOKEN_SIZE;
+ 		break;
+ 	default:
+ 		dev_err(dev->mt76.dev, "WED version %d is not supported\n",
+@@ -678,7 +685,10 @@
+ 			wed->wlan.id = 0x7992;
+ 	}
+ 
+-	wed->wlan.nbuf = tx_token_size;
++	if (wed_tx_tokens)
++		wed_tokens = clamp_t(unsigned int, wed_tx_tokens & ~127, 1024,
++				     MT7996_WED_TOKEN_SIZE);
++	wed->wlan.nbuf = wed_tokens;
+ 	wed->wlan.token_start = 0;
+ 	wed->wlan.hif2 = hif2;
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -94,6 +94,8 @@
+ #define MT7996_EXT_EEPROM_BLOCK_SIZE	1024
+ #define MT7996_HW_TOKEN_SIZE		8192
+ #define MT7996_WED_TOKEN_SIZE		16384
++/* WED 3.1 runs firmware RED, which keeps one station from holding the pool */
++#define MT7996_WED_V3_1_TOKEN_SIZE	4096
+ #define MT7996_SW_TOKEN_SIZE		15360
+ 
+ #define MT7996_CFEND_RATE_DEFAULT	0x49	/* OFDM 24M */
