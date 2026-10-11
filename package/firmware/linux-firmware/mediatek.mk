@@ -97,13 +97,23 @@ define Package/mt7986-wo-firmware/install
 endef
 $(eval $(call BuildPackage,mt7986-wo-firmware))
 
+# v7.3 (2026/02/25) from MediaTek's feed, until linux-firmware carries it
+define Download/mt7987-2p5g-phy-pmb
+  URL:=https://raw.githubusercontent.com/mediatek/mtk-openwrt-feeds/b888cb555b3104bb13ccd65679f3a343c2773636/feed/app/mt798x-2p5g-phy-firmware-internal/files/mt7987
+  URL_FILE:=i2p5ge-phy-pmb.bin
+  FILE:=mt7987-i2p5ge-phy-pmb-20260225.bin
+  HASH:=230f28cf9fa149cc9aff80ef26108d9f26a37509f894941efb5f39c2f008e085
+endef
+$(eval $(call Download,mt7987-2p5g-phy-pmb))
+
 Package/mt7987-2p5g-phy-firmware = $(call Package/firmware-default,MT7987 built-in 2.5G Ethernet PHY firmware,@TARGET_mediatek_filogic +kmod-phy-mediatek-2p5g,LICENCE.mediatek,,nonshared)
 define Package/mt7987-2p5g-phy-firmware/install
 	$(INSTALL_DIR) $(1)/lib/firmware/mediatek/mt7987
 	$(INSTALL_DATA) \
 		$(PKG_BUILD_DIR)/mediatek/mt7987/i2p5ge-phy-DSPBitTb.bin \
-		$(PKG_BUILD_DIR)/mediatek/mt7987/i2p5ge-phy-pmb.bin \
 		$(1)/lib/firmware/mediatek/mt7987
+	$(INSTALL_DATA) $(DL_DIR)/mt7987-i2p5ge-phy-pmb-20260225.bin \
+		$(1)/lib/firmware/mediatek/mt7987/i2p5ge-phy-pmb.bin
 endef
 $(eval $(call BuildPackage,mt7987-2p5g-phy-firmware))
 
