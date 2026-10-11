@@ -1,0 +1,31 @@
+From: Michael-CY Lee <michael-cy.lee@mediatek.com>
+Date: Fri, 11 Oct 2024 14:50:10 +0800
+Subject: [PATCH] mtk: hostapd: clear authroized flag when removing STA from the
+ driver during association handling
+
+When removing the STA from the driver, authorized flag should be cleared
+at the same time. Failing to do so may result in the STA being re-added
+with authorized flag enabled.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/08196fa6e5d338ce88aa0002f781e2d24289b1f1/autobuild/unified/filogic/mac80211/25.12/files/package/network/services/hostapd/patches/0111-mtk-hostapd-clear-authroized-flag-when-removing-STA-.patch
+Signed-off-by: Michael-CY Lee <michael-cy.lee@mediatek.com>
+[plcharriere: clear it with ap_sta_set_authorized() before the driver
+entry is removed, as ap_sta_re_add() does, instead of with
+ap_sta_set_authorized_flag() after it, so that the change is reported
+like any other and a later disconnect is not lost]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ src/ap/ieee802_11.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6771,6 +6771,7 @@ static int add_associated_sta(struct hos
+ 	     (!wpa_auth_sta_ft_tk_already_set(sta->wpa_sm) &&
+ 	      !wpa_auth_sta_fils_tk_already_set(sta->wpa_sm)) ||
+ 	     (!reassoc && (sta->flags & WLAN_STA_AUTHORIZED)))) {
++		ap_sta_set_authorized(hapd, sta, 0);
+ 		hostapd_drv_sta_remove(hapd, sta->addr);
+ 		wpa_auth_sm_event(sta->wpa_sm, WPA_DRV_STA_REMOVED);
+ 		set = 0;
