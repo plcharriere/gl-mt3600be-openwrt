@@ -1,0 +1,43 @@
+From: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+Date: Wed, 30 Sep 2026 14:31:14 +0800
+Subject: [PATCH] mtk: mt76: fix the behavior of radar detection for bootup CAC
+
+The previous solution only addressed radar detection during in-service
+monitoring or runtime CAC.
+However, during bootup CAC, if a radar is detected, the AP bypasses the
+channel switch flow because it has not yet fully started, which prevents
+MAC TX from resuming.
+To ensure a robust solution across Wi-Fi 6, and 7 generations,
+we now invoke the resume TX MCU command directly within mt79xx_set_channel.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/4c3096b7487cf54c9396c1e1b8c5841e24bfaf85/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0127-cp-mtk-mt76-fix-the-behavior-of-radar-detection-for-boo.patch
+Signed-off-by: StanleyYP Wang <StanleyYP.Wang@mediatek.com>
+[plcharriere: mt7996 part only]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/main.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -704,6 +704,10 @@ int mt7996_set_channel(struct mt76_phy *
+ 	if (ret)
+ 		goto out;
+ 
++	ret = mt7996_mcu_rdd_resume_tx(phy);
++	if (ret)
++		goto out;
++
+ 	ret = mt7996_dfs_init_radar_detector(phy);
+ 	mt7996_mac_cca_stats_reset(phy);
+ 
+@@ -1152,8 +1156,6 @@ mt7996_post_channel_switch(struct ieee80
+ 
+ 	ieee80211_iterate_stations_mtx(hw, mt7996_mcu_update_sta_rec_bw, link);
+ 
+-	ret = mt7996_mcu_rdd_resume_tx(phy);
+-
+ out:
+ 	mutex_unlock(&dev->mt76.mutex);
+ 
