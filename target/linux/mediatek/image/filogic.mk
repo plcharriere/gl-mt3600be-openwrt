@@ -2040,8 +2040,8 @@ define Device/glinet_gl-mt3600be
   KERNEL_IN_UBI := 1
   KERNEL_LOADADDR := 0x40000000
   UBINIZE_OPTS := -E 5
-  BLOCKSIZE := 128k
-  PAGESIZE := 2048
+  BLOCKSIZE := 256k
+  PAGESIZE := 4096
   IMAGE_SIZE := 483328k
   IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 endef
