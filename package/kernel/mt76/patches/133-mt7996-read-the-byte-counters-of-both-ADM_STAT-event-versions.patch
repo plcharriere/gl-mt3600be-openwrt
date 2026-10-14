@@ -1,0 +1,111 @@
+From: Shayne Chen <shayne.chen@mediatek.com>
+Date: Tue, 10 Mar 2026 17:32:13 +0800
+Subject: [PATCH] mt7996: read the byte counters of both ADM_STAT event versions
+
+Newer firmware adds the bytes of failed transmissions to each station
+entry of the ALL_STA_INFO ADM_STAT event, so an entry is 52 bytes instead
+of 36. The driver reads every entry as 36 bytes: only the first station
+of an event gets its byte counters, the other entries are read at a wrong
+offset, usually of no station, and the TX and RX bytes of those stations
+stay at zero.
+
+Tell the two versions apart by the length of the event, as MediaTek's
+driver does, and read each entry with its own size.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/7a38cb57511c6884638d72e26aaa14eb34c496c6/autobuild/unified/filogic/mac80211/25.12/files/package/kernel/mt76/patches/0044-mtk-mt76-rework-statistics-report-for-mt7996.patch
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+[plcharriere: ADM_STAT parsing only, without the counters of failed bytes]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/mcu.c | 25 +++++++++++++++++++------
+ mt7996/mcu.h | 12 +++++++++++-
+ 2 files changed, 30 insertions(+), 7 deletions(-)
+
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -829,6 +829,7 @@ static void
+ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt7996_mcu_all_sta_info_event *res;
++	bool adm_v1;
+ 	u32 elem_size;
+ 	u16 sta_num;
+ 	u16 i;
+@@ -843,12 +844,14 @@ mt7996_mcu_rx_all_sta_info_event(struct
+ 		return;
+ 
+ 	sta_num = le16_to_cpu(res->sta_num);
++	adm_v1 = le16_to_cpu(res->len) == UNI_EVENT_SIZE_ADM_STAT_V1;
+ 	switch (le16_to_cpu(res->tag)) {
+ 	case UNI_ALL_STA_TXRX_RATE:
+ 		elem_size = sizeof(res->rate[0]);
+ 		break;
+ 	case UNI_ALL_STA_TXRX_ADM_STAT:
+-		elem_size = sizeof(res->adm_stat[0]);
++		elem_size = adm_v1 ? sizeof(res->adm_stat_v1[0]) :
++				     sizeof(res->adm_stat_v2[0]);
+ 		break;
+ 	case UNI_ALL_STA_TXRX_MSDU_COUNT:
+ 		elem_size = sizeof(res->msdu_cnt[0]);
+@@ -885,17 +888,27 @@ mt7996_mcu_rx_all_sta_info_event(struct
+ 				dev_err(dev->mt76.dev, "Failed to update TX GI\n");
+ 			break;
+ 		case UNI_ALL_STA_TXRX_ADM_STAT:
+-			wlan_idx = le16_to_cpu(res->adm_stat[i].wlan_idx);
++			if (adm_v1)
++				wlan_idx = le16_to_cpu(res->adm_stat_v1[i].wlan_idx);
++			else
++				wlan_idx = le16_to_cpu(res->adm_stat_v2[i].wlan_idx);
+ 			wcid = mt76_wcid_ptr(dev, wlan_idx);
+ 
+ 			if (!wcid)
+ 				break;
+ 
+ 			for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+-				wcid->stats.tx_bytes +=
+-					le32_to_cpu(res->adm_stat[i].tx_bytes[ac]);
+-				wcid->stats.rx_bytes +=
+-					le32_to_cpu(res->adm_stat[i].rx_bytes[ac]);
++				if (adm_v1) {
++					wcid->stats.tx_bytes +=
++						le32_to_cpu(res->adm_stat_v1[i].tx_bytes[ac]);
++					wcid->stats.rx_bytes +=
++						le32_to_cpu(res->adm_stat_v1[i].rx_bytes[ac]);
++				} else {
++					wcid->stats.tx_bytes +=
++						le32_to_cpu(res->adm_stat_v2[i].tx_bytes[ac]);
++					wcid->stats.rx_bytes +=
++						le32_to_cpu(res->adm_stat_v2[i].rx_bytes[ac]);
++				}
+ 			}
+ 			break;
+ 		case UNI_ALL_STA_TXRX_MSDU_COUNT:
+--- a/mt7996/mcu.h
++++ b/mt7996/mcu.h
+@@ -231,6 +231,8 @@ struct all_sta_trx_rate {
+ 	u8 __rsv2;
+ } __packed;
+ 
++#define UNI_EVENT_SIZE_ADM_STAT_V1	1452
++
+ struct mt7996_mcu_all_sta_info_event {
+ 	u8 rsv[4];
+ 	__le16 tag;
+@@ -247,7 +249,15 @@ struct mt7996_mcu_all_sta_info_event {
+ 			u8 rsv[2];
+ 			__le32 tx_bytes[IEEE80211_NUM_ACS];
+ 			__le32 rx_bytes[IEEE80211_NUM_ACS];
+-		} __packed, adm_stat);
++		} __packed, adm_stat_v1);
++
++		DECLARE_FLEX_ARRAY(struct {
++			__le16 wlan_idx;
++			u8 rsv[2];
++			__le32 tx_bytes[IEEE80211_NUM_ACS];
++			__le32 rx_bytes[IEEE80211_NUM_ACS];
++			__le32 tx_bytes_failed[IEEE80211_NUM_ACS];
++		} __packed, adm_stat_v2);
+ 
+ 		DECLARE_FLEX_ARRAY(struct {
+ 			__le16 wlan_idx;
