@@ -1,0 +1,64 @@
+From: Rex Lu <rex.lu@mediatek.com>
+Date: Thu, 27 Aug 2026 11:31:49 +0800
+Subject: [PATCH] net: ethernet: mtk_wed: size the TX buffer pool from the
+ token count
+
+The TX buffer manager of WED v3 and v3.1 gets a fixed number of buffers,
+sized for the 16384 TX tokens of mt7996: 32768 on v3 and 17408 on v3.1.
+A WLAN driver that gives WED fewer tokens never uses most of them, and a
+reset allocates the new pool before it frees the old one.
+
+Size the pool from the token count of the WLAN driver, with the same
+formulas: twice the tokens on v3, the tokens plus 1024 on v3.1.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/0a986b74baf1461993b2eccfd9be371c7d887afc/25.12/files/target/linux/mediatek/patches-6.12/999-wed-23-Add-adjust-TX_BM_PKT_CNT-based-on-hw-token.patch
+Signed-off-by: Rex Lu <rex.lu@mediatek.com>
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_wed.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_wed.c
++++ b/drivers/net/ethernet/mediatek/mtk_wed.c
+@@ -46,8 +46,8 @@
+ #define MTK_WED_MIOD_ENTRY_CNT		128
+ 
+ #define MTK_WED_TX_BM_DMA_SIZE		65536
+-#define MTK_WED_TX_BM_PKT_CNT		32768
+-#define MTK_WED_TX_BM_PKT_CNT_V3_1	17408
++#define MTK_WED_TX_BM_PKT_CNT(dev)	((dev)->wlan.nbuf * 2)
++#define MTK_WED_TX_BM_PKT_CNT_V3_1(dev)	((dev)->wlan.nbuf + 1024)
+ 
+ static struct mtk_wed_hw *hw_list[3];
+ static DEFINE_MUTEX(hw_lock);
+@@ -707,9 +707,9 @@ mtk_wed_tx_buffer_alloc(struct mtk_wed_d
+ 	} else {
+ 		dev->tx_buf_ring.size = MTK_WED_TX_BM_DMA_SIZE;
+ 		if (mtk_wed_is_v3_1(dev->hw))
+-			ring_size = MTK_WED_TX_BM_PKT_CNT_V3_1;
++			ring_size = MTK_WED_TX_BM_PKT_CNT_V3_1(dev);
+ 		else
+-			ring_size = MTK_WED_TX_BM_PKT_CNT;
++			ring_size = MTK_WED_TX_BM_PKT_CNT(dev);
+ 	}
+ 	n_pages = dev->tx_buf_ring.size / MTK_WED_BUF_PER_PAGE;
+ 
+@@ -1750,14 +1750,14 @@ mtk_wed_hw_init(struct mtk_wed_device *d
+ 			MTK_WED_TX_TKID_CTRL_FREE_FORMAT);
+ 
+ 		wed_w32(dev, MTK_WED_TX_BM_INIT_PTR,
+-			MTK_WED_TX_BM_PKT_CNT |
++			MTK_WED_TX_BM_PKT_CNT(dev) |
+ 			MTK_WED_TX_BM_INIT_SW_TAIL_IDX);
+ 	} else if (mtk_wed_is_v3_1(dev->hw)) {
+ 		wed_w32(dev, MTK_WED_TX_BM_RANGE_CFG,
+-			MTK_WED_TX_BM_PKT_CNT_V3_1);
++			MTK_WED_TX_BM_PKT_CNT_V3_1(dev));
+ 
+ 		wed_w32(dev, MTK_WED_TX_BM_INIT_PTR,
+-			MTK_WED_TX_BM_PKT_CNT_V3_1 |
++			MTK_WED_TX_BM_PKT_CNT_V3_1(dev) |
+ 			MTK_WED_TX_BM_INIT_SW_TAIL_IDX);
+ 	}
+ 
