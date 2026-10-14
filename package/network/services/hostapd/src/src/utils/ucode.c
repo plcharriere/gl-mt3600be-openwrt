@@ -174,11 +174,9 @@ uc_value_t *uc_wpa_freq_info(uc_vm_t *vm, size_t nargs)
 	ucv_object_add(ret, "frequency", ucv_int64_new(freq_val));
 	ucv_object_add(ret, "oper_chwidth", ucv_int64_new(chanwidth));
 
-	if (!sec_channel)
-		return ret;
-
-	if (freq_val < 3000) {
-		ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(0));
+	if (chanwidth == CONF_OPER_CHWIDTH_USE_HT) {
+		center_idx = freq_val < 3000 ? 0 : channel + 2 * sec_channel;
+		ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(center_idx));
 		ucv_object_add(ret, "center_freq1",
 			       ucv_int64_new(freq_val + sec_channel * 10));
 		return ret;
