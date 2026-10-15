@@ -137,6 +137,10 @@ elecom,wrc-x6000gsd|\
 elecom,wrc-x6000qs)
 	ucidef_set_led_netdev "wan" "wan" "mdio-bus:05:white:wan" "wan" "link tx rx"
 	;;
+glinet,gl-mt3600be)
+	ucidef_set_led_trigger "online" "online" "white:status" "online"
+	ucidef_set_led_trigger "offline" "offline" "blue:status" "offline"
+	;;
 glinet,gl-x3000|\
 glinet,gl-xe3000)
 	ucidef_set_led_default "power" "POWER" "green:power" "1"
