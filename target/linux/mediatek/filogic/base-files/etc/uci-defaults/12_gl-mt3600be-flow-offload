@@ -1,0 +1,16 @@
+. /lib/functions.sh
+
+[ "$(board_name)" = "glinet,gl-mt3600be" ] || exit 0
+
+# keep any flow offloading setting, and SQM, which hardware offloading bypasses
+[ -z "$(uci -q get firewall.@defaults[0].flow_offloading)" ] || exit 0
+[ -z "$(uci -q get firewall.@defaults[0].flow_offloading_hw)" ] || exit 0
+uci -q show sqm | grep -q "\.enabled='1'$" && exit 0
+
+uci -q batch <<-EOT
+	set firewall.@defaults[0].flow_offloading='1'
+	set firewall.@defaults[0].flow_offloading_hw='1'
+	commit firewall
+EOT
+
+exit 0
