@@ -1,0 +1,164 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 15 Oct 2026 09:04:22 +0900
+Subject: [PATCH] wifi: mt76: drop 802.3 frames that fail the PN check
+
+mt76 marks a received frame RX_FLAG_ONLY_MONITOR when its CCMP PN is not
+above the last PN of its TID, and the drivers mark frames with an ICV or
+MIC error the same way. mac80211 drops such frames in its monitor step,
+which it runs for 802.11 frames only. Frames the hardware converted to
+802.3 skip it and are delivered like any other frame: a retransmission
+that reaches the host twice is received twice.
+
+Drop 802.3 frames marked RX_FLAG_ONLY_MONITOR in mt76_rx_complete().
+
+With WED or an NPU, mt76 does not reorder in software, and the hardware
+reordering does not cover every block-ack session: the mt7996 hardware
+takes no session with a window smaller than 64 frames, which some
+clients use for some TIDs. A frame of such a session that is
+retransmitted after later ones arrives with an older PN and is no
+replay, but so does a retransmission of a frame that was already
+delivered. Keep the PNs of the last 64 frames delivered on such a
+session, and deliver a frame with an older PN only when its PN is not
+among them and is newer than the oldest of them.
+
+Fixes: 3c1032e12217 ("mt76: allow receiving frames with invalid CCMP PN via monitor interfaces")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -1312,15 +1312,53 @@ mt76_rx_convert(struct mt76_dev *dev, st
+ 	*hw = mt76_phy_hw(dev, mstat.phy_idx);
+ }
+ 
++static struct mt76_rx_tid *
++mt76_rx_ba_session(struct mt76_wcid *wcid, int tidno)
++{
++	if (tidno >= ARRAY_SIZE(wcid->aggr))
++		return NULL;
++
++	wcid = mt76_wcid_primary(wcid);
++
++	return rcu_dereference(wcid->aggr[tidno]);
++}
++
++static void
++mt76_rx_pn_add(struct mt76_rx_tid *tid, u64 pn)
++{
++	tid->pn[tid->pn_idx] = pn;
++	tid->pn_idx = (tid->pn_idx + 1) % MT76_RX_PN_HISTORY;
++	if (tid->pn_count < MT76_RX_PN_HISTORY)
++		tid->pn_count++;
++}
++
++static bool
++mt76_rx_pn_late(struct mt76_rx_tid *tid, u64 pn)
++{
++	u64 oldest = U64_MAX;
++	int i;
++
++	for (i = 0; i < tid->pn_count; i++) {
++		if (tid->pn[i] == pn)
++			return false;
++
++		oldest = min(oldest, tid->pn[i]);
++	}
++
++	return tid->pn_count && pn > oldest;
++}
++
+ static void
+-mt76_check_ccmp_pn(struct sk_buff *skb)
++mt76_check_ccmp_pn(struct mt76_dev *dev, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+ 	struct mt76_wcid *wcid = status->wcid;
++	struct mt76_rx_tid *tid = NULL;
+ 	struct ieee80211_hdr *hdr;
+ 	struct mt76_wcid *pn_wcid;
+ 	int security_idx;
+-	int ret;
++	u64 pn = 0;
++	int ret, i;
+ 
+ 	if (!(status->flag & RX_FLAG_DECRYPTED))
+ 		return;
+@@ -1363,6 +1401,31 @@ skip_hdr_check:
+ 	BUILD_BUG_ON(sizeof(status->iv) != sizeof(wcid->rx_key_pn[0]));
+ 	ret = memcmp(status->iv, pn_wcid->rx_key_pn[security_idx],
+ 		     sizeof(status->iv));
++
++	/* Without software reordering, a frame of a block-ack session
++	 * that the hardware does not reorder can arrive after later ones
++	 * when it is retransmitted. Keep the PNs delivered on the session:
++	 * an older PN is no replay if no frame with that PN was delivered
++	 * and it is newer than the oldest PN kept.
++	 */
++	if ((status->flag & RX_FLAG_8023) &&
++	    (mtk_wed_device_active(&dev->mmio.wed) ||
++	     mt76_npu_device_active(dev)))
++		tid = mt76_rx_ba_session(wcid, security_idx);
++
++	if (tid) {
++		for (i = 0; i < sizeof(status->iv); i++)
++			pn = (pn << 8) | status->iv[i];
++
++		if (ret < 0 && mt76_rx_pn_late(tid, pn)) {
++			mt76_rx_pn_add(tid, pn);
++			return;
++		}
++
++		if (ret > 0)
++			mt76_rx_pn_add(tid, pn);
++	}
++
+ 	if (ret <= 0) {
+ 		status->flag |= RX_FLAG_ONLY_MONITOR;
+ 		return;
+@@ -1545,9 +1608,20 @@ void mt76_rx_complete(struct mt76_dev *d
+ 
+ 	spin_lock(&dev->rx_lock);
+ 	while ((skb = __skb_dequeue(frames)) != NULL) {
++		struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+ 		struct sk_buff *nskb = skb_shinfo(skb)->frag_list;
+ 
+-		mt76_check_ccmp_pn(skb);
++		mt76_check_ccmp_pn(dev, skb);
++
++		/* mac80211 passes 802.3 frames to no monitor interface and
++		 * ignores RX_FLAG_ONLY_MONITOR for them
++		 */
++		if ((status->flag & RX_FLAG_8023) &&
++		    (status->flag & RX_FLAG_ONLY_MONITOR)) {
++			dev_kfree_skb(skb);
++			continue;
++		}
++
+ 		skb_shinfo(skb)->frag_list = NULL;
+ 		mt76_rx_convert(dev, skb, &hw, &sta);
+ 		ieee80211_rx_list(hw, sta, skb, &list);
+--- a/mt76.h
++++ b/mt76.h
+@@ -471,6 +471,8 @@ struct mt76_txwi_cache {
+ 	u8 phy_idx;
+ };
+ 
++#define MT76_RX_PN_HISTORY		64
++
+ struct mt76_rx_tid {
+ 	struct rcu_head rcu_head;
+ 
+@@ -488,6 +490,13 @@ struct mt76_rx_tid {
+ 
+ 	u8 started:1, stopped:1, timer_pending:1;
+ 
++	/* PNs of the last frames delivered on a session that is not
++	 * reordered in software
++	 */
++	u64 pn[MT76_RX_PN_HISTORY];
++	u8 pn_idx;
++	u8 pn_count;
++
+ 	struct sk_buff *reorder_buf[];
+ };
+ 
