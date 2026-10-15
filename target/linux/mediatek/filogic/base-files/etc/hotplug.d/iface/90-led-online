@@ -1,0 +1,25 @@
+#!/bin/sh
+
+case "$ACTION" in
+ifup|ifdown|ifupdate) ;;
+*) exit 0 ;;
+esac
+
+/etc/init.d/led enabled || exit 0
+
+. /lib/functions.sh
+
+update_led() {
+	local sysfs trigger
+
+	config_get trigger "$1" trigger
+	case "$trigger" in
+	online|offline)
+		config_get sysfs "$1" sysfs
+		/etc/init.d/led start "$sysfs"
+		;;
+	esac
+}
+
+config_load system
+config_foreach update_led led
