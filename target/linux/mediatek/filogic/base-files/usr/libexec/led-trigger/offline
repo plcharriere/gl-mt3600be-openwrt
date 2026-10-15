@@ -1,0 +1,5 @@
+#!/bin/sh
+
+# Blink the LED while the router has no default route, see online.
+
+. /usr/libexec/led-trigger/online

@@ -1,0 +1,22 @@
+#!/bin/sh
+
+# Light the LED while the router has a default route. With the offline
+# trigger, blink it while the router has none. The iface hotplug script
+# 90-led-online applies this again when an interface changes.
+
+. /lib/functions/leds.sh
+. /lib/functions/network.sh
+
+network_flush_cache
+
+if network_find_wan led_wan || network_find_wan6 led_wan; then
+	case "$trigger" in
+	online) led_on "$sysfs" ;;
+	offline) led_off "$sysfs" ;;
+	esac
+else
+	case "$trigger" in
+	online) led_off "$sysfs" ;;
+	offline) led_timer "$sysfs" 500 500 ;;
+	esac
+fi
