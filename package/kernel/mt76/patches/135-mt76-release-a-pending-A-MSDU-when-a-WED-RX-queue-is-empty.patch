@@ -1,0 +1,182 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Thu, 15 Oct 2026 13:05:00 +0900
+Subject: [PATCH] wifi: mt76: release a pending A-MSDU when a WED RX queue is
+ empty
+
+mt76_rx_release_burst() keeps the subframes of an A-MSDU until its last
+subframe arrives, or until the next frame of the same radio on that
+queue shows that the A-MSDU has ended.
+
+With WED, the subframes of flows that the PPE has bound are forwarded by
+the hardware and never reach the host. When the last subframe of an
+A-MSDU is one of them, the subframes that the host received wait for the
+next frame of that radio on that queue, which can take seconds when the
+clients send little to the host: a DNS query that a client sends in the
+same A-MSDU as TCP ACKs of an offloaded download is answered only when
+another frame arrives.
+
+When a poll finds a WED RX queue empty, release the A-MSDUs that are
+still pending 200 us later, with a timer that polls the queue again:
+a subframe that the hardware writes in the meantime still joins its
+A-MSDU, instead of arriving on its own with the PN of the subframes
+before it and failing the PN check.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/dma.c
++++ b/dma.c
+@@ -1112,6 +1112,14 @@ int mt76_dma_rx_poll(struct napi_struct
+ 
+ 	do {
+ 		cur = mt76_dma_rx_process(dev, &dev->q_rx[qid], budget - done);
++
++		/* WED can forward subframes of an A-MSDU in hardware, so the
++		 * last one may never reach the host: once the queue is empty,
++		 * pass on the subframes received so far after a short wait
++		 */
++		if (!cur && mt76_queue_is_wed_rx(&dev->q_rx[qid]))
++			mt76_rx_check_pending_amsdu(dev, qid);
++
+ 		mt76_rx_poll_complete(dev, qid, napi);
+ 		done += cur;
+ 	} while (cur && done < budget);
+@@ -1227,6 +1235,7 @@ void mt76_dma_cleanup(struct mt76_dev *d
+ 	for (i = 0; i < ARRAY_SIZE(dev->q_mcu); i++)
+ 		mt76_dma_tx_cleanup(dev, dev->q_mcu[i], true);
+ 
++	hrtimer_cancel(&dev->rx_amsdu_timer);
+ 	for (i = 0; i < ARRAY_SIZE(dev->napi); i++) {
+ 		if (test_bit(NAPI_STATE_LISTED, &dev->napi[i].state))
+ 			netif_napi_del(&dev->napi[i]);
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -666,6 +666,19 @@ int mt76_create_page_pool(struct mt76_de
+ }
+ EXPORT_SYMBOL_GPL(mt76_create_page_pool);
+ 
++static enum hrtimer_restart mt76_rx_amsdu_timer(struct hrtimer *timer)
++{
++	struct mt76_dev *dev = container_of(timer, struct mt76_dev,
++					    rx_amsdu_timer);
++	int q;
++
++	for_each_set_bit(q, dev->rx_amsdu_poll, __MT_RXQ_MAX)
++		if (test_and_clear_bit(q, dev->rx_amsdu_poll))
++			napi_schedule(&dev->napi[q]);
++
++	return HRTIMER_NORESTART;
++}
++
+ struct mt76_dev *
+ mt76_alloc_device(struct device *pdev, unsigned int size,
+ 		  const struct ieee80211_ops *ops,
+@@ -727,6 +740,9 @@ mt76_alloc_device(struct device *pdev, u
+ 	INIT_LIST_HEAD(&dev->sta_poll_list);
+ 	spin_lock_init(&dev->sta_poll_lock);
+ 
++	hrtimer_setup(&dev->rx_amsdu_timer, mt76_rx_amsdu_timer,
++		      CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++
+ 	INIT_LIST_HEAD(&dev->txwi_cache);
+ 	INIT_LIST_HEAD(&dev->rxwi_cache);
+ 	dev->token_size = dev->drv->token_size;
+@@ -822,6 +838,7 @@ EXPORT_SYMBOL_GPL(mt76_unregister_device
+ 
+ void mt76_free_device(struct mt76_dev *dev)
+ {
++	hrtimer_cancel(&dev->rx_amsdu_timer);
+ 	mt76_worker_teardown(&dev->tx_worker);
+ 	if (dev->wq) {
+ 		destroy_workqueue(dev->wq);
+@@ -889,6 +906,11 @@ struct mt76_phy *mt76_vif_phy(struct iee
+ }
+ EXPORT_SYMBOL_GPL(mt76_vif_phy);
+ 
++/* how long a pending A-MSDU waits for more subframes once its WED RX
++ * queue is empty
++ */
++#define MT76_RX_AMSDU_WAIT_NS		(200 * NSEC_PER_USEC)
++
+ static void mt76_rx_release_amsdu(struct mt76_phy *phy, enum mt76_rxq_id q)
+ {
+ 	struct sk_buff *skb = phy->rx_amsdu[q].head;
+@@ -898,6 +920,7 @@ static void mt76_rx_release_amsdu(struct
+ 
+ 	phy->rx_amsdu[q].head = NULL;
+ 	phy->rx_amsdu[q].tail = NULL;
++	phy->rx_amsdu[q].since = 0;
+ 
+ 	/*
+ 	 * Validate if the amsdu has a proper first subframe.
+@@ -950,12 +973,43 @@ static void mt76_rx_release_burst(struct
+ 	} else {
+ 		*phy->rx_amsdu[q].tail = skb;
+ 		phy->rx_amsdu[q].tail = &skb->next;
++		phy->rx_amsdu[q].since = 0;
+ 	}
+ 
+ 	if (!status->amsdu || status->last_amsdu)
+ 		mt76_rx_release_amsdu(phy, q);
+ }
+ 
++void mt76_rx_check_pending_amsdu(struct mt76_dev *dev, enum mt76_rxq_id q)
++{
++	u64 now = ktime_get_ns(), wait = U64_MAX;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(dev->phys); i++) {
++		struct mt76_phy *phy = dev->phys[i];
++		u64 elapsed;
++
++		if (!phy || !phy->rx_amsdu[q].head)
++			continue;
++
++		if (!phy->rx_amsdu[q].since)
++			phy->rx_amsdu[q].since = now;
++
++		elapsed = now - phy->rx_amsdu[q].since;
++		if (elapsed >= MT76_RX_AMSDU_WAIT_NS)
++			mt76_rx_release_amsdu(phy, q);
++		else
++			wait = min_t(u64, wait, MT76_RX_AMSDU_WAIT_NS - elapsed);
++	}
++
++	if (wait == U64_MAX)
++		return;
++
++	set_bit(q, dev->rx_amsdu_poll);
++	hrtimer_start(&dev->rx_amsdu_timer, ns_to_ktime(wait),
++		      HRTIMER_MODE_REL);
++}
++
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb)
+ {
+ 	struct mt76_rx_status *status = (struct mt76_rx_status *)skb->cb;
+--- a/mt76.h
++++ b/mt76.h
+@@ -941,6 +941,7 @@ struct mt76_phy {
+ 		struct sk_buff *head;
+ 		struct sk_buff **tail;
+ 		u16 seqno;
++		u64 since;
+ 	} rx_amsdu[__MT_RXQ_MAX];
+ 
+ 	struct mt76_freq_range_power *frp;
+@@ -987,6 +988,8 @@ struct mt76_dev {
+ 	struct net_device *tx_napi_dev;
+ 	spinlock_t rx_lock;
+ 	struct napi_struct napi[__MT_RXQ_MAX];
++	struct hrtimer rx_amsdu_timer;
++	DECLARE_BITMAP(rx_amsdu_poll, __MT_RXQ_MAX);
+ 	struct sk_buff_head rx_skb[__MT_RXQ_MAX];
+ 	struct tasklet_struct irq_tasklet;
+ 
+@@ -1576,6 +1579,7 @@ static inline bool mt76_is_testmode_skb(
+ }
+ 
+ void mt76_rx(struct mt76_dev *dev, enum mt76_rxq_id q, struct sk_buff *skb);
++void mt76_rx_check_pending_amsdu(struct mt76_dev *dev, enum mt76_rxq_id q);
+ void mt76_tx(struct mt76_phy *dev, struct ieee80211_sta *sta,
+ 	     struct mt76_wcid *wcid, struct sk_buff *skb);
+ void mt76_wake_tx_queue(struct ieee80211_hw *hw, struct ieee80211_txq *txq);
