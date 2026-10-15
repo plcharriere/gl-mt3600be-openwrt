@@ -596,6 +596,10 @@ _ucidef_set_led_trigger() {
 	json_select ..
 }
 
+ucidef_set_led_trigger() {
+	_ucidef_set_led_trigger "$1" "$2" "$3" "$4"
+}
+
 ucidef_set_led_usbdev() {
 	local dev="$4"
 
