@@ -341,7 +341,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  static int __mtk_foe_entry_idle_time(struct mtk_ppe *ppe, u32 ib1)
  {
  	u32 ib1_ts_mask = mtk_get_ib1_ts_mask(ppe->eth);
-@@ -748,7 +974,7 @@ int mtk_foe_entry_commit(struct mtk_ppe
+@@ -762,7 +988,7 @@ int mtk_foe_entry_commit(struct mtk_ppe
  
  static void
  mtk_foe_entry_commit_subflow(struct mtk_ppe *ppe, struct mtk_flow_entry *entry,
@@ -350,7 +350,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  {
  	const struct mtk_soc_data *soc = ppe->eth->soc;
  	struct mtk_flow_entry *flow_info;
-@@ -763,9 +989,12 @@ mtk_foe_entry_commit_subflow(struct mtk_
+@@ -777,9 +1003,12 @@ mtk_foe_entry_commit_subflow(struct mtk_
  
  	flow_info->type = MTK_FLOW_TYPE_L2_SUBFLOW;
  	flow_info->hash = hash;
@@ -366,7 +366,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  
  	hwe = mtk_foe_get_entry(ppe, hash);
  	memcpy(&flow_info->data, hwe, soc->foe_entry_size);
-@@ -784,10 +1013,20 @@ mtk_foe_entry_commit_subflow(struct mtk_
+@@ -798,10 +1027,20 @@ mtk_foe_entry_commit_subflow(struct mtk_
  
  	*mtk_foe_entry_ib2(ppe->eth, &flow_info->data) = entry->data.bridge.ib2;
  
@@ -388,42 +388,36 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  {
  	const struct mtk_soc_data *soc = ppe->eth->soc;
  	struct hlist_head *head = &ppe->foe_flow[hash / soc->hash_offset];
-@@ -799,6 +1038,7 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+@@ -812,6 +1051,7 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+ 	struct hlist_node *n;
  	struct ethhdr *eh;
- 	bool found = false;
  	int entry_len;
 +	int dscp;
  	u8 *tag;
  
  	spin_lock_bh(&ppe_lock);
-@@ -809,6 +1049,8 @@ void __mtk_ppe_check_skb(struct mtk_ppe
+@@ -822,6 +1062,8 @@ void __mtk_ppe_check_skb(struct mtk_ppe
  	entry_len = mtk_flow_entry_match_len(ppe->eth, hwe);
  	memcpy(&foe, hwe, entry_len);
  
 +	dscp = mtk_ppe_skb_dscp(skb);
 +
  	hlist_for_each_entry_safe(entry, n, head, list) {
- 		if (found ||
- 		    !mtk_flow_entry_match(ppe->eth, entry, &foe, entry_len)) {
-@@ -817,9 +1059,16 @@ void __mtk_ppe_check_skb(struct mtk_ppe
- 			continue;
- 		}
+ 		if (!bound &&
+ 		    mtk_flow_entry_match(ppe->eth, entry, &foe, entry_len)) {
+@@ -839,6 +1081,11 @@ void __mtk_ppe_check_skb(struct mtk_ppe
  
-+		found = true;
-+		if (!mtk_foe_entry_set_prio(ppe, entry, &entry->data, dscp)) {
-+			entry->hash = 0xffff;
-+			continue;
-+		}
+ 	/* Save all previous slot counts before resetting the hardware entry. */
+ 	if (bound) {
++		if (!mtk_foe_entry_set_prio(ppe, bound, &bound->data, dscp))
++			goto out;
 +
-+		entry->rx_wed_index = rx_wed_index;
-+		entry->rx_wcid = rx_wcid;
- 		entry->hash = hash;
- 		__mtk_foe_entry_commit(ppe, &entry->data, hash);
--		found = true;
- 	}
- 
- 	if (found)
-@@ -856,7 +1105,8 @@ void __mtk_ppe_check_skb(struct mtk_ppe
++		bound->rx_wed_index = rx_wed_index;
++		bound->rx_wcid = rx_wcid;
+ 		bound->hash = hash;
+ 		__mtk_foe_entry_commit(ppe, &bound->data, hash);
+ 		goto out;
+@@ -875,7 +1122,8 @@ void __mtk_ppe_check_skb(struct mtk_ppe
  	if (!entry)
  		goto out;
  
@@ -544,7 +538,7 @@ Signed-off-by: Felix Fietkau <nbd@nbd.name>
  
  	err = mtk_foe_entry_commit(eth->ppe[entry->ppe_index], entry);
  	if (err < 0)
-@@ -641,6 +645,66 @@ int mtk_flow_offload_cmd(struct mtk_eth
+@@ -644,6 +648,66 @@ int mtk_flow_offload_cmd(struct mtk_eth
  	return err;
  }
  
