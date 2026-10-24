@@ -1,0 +1,46 @@
+From: Eugene Bykov <omedius@gmail.com>
+Date: Sun, 11 Oct 2026 12:49:27 +0000
+Subject: [PATCH] wifi: mt76: mt7996: advertise VHT beamformee STS 2 on MT7990
+
+The MT7990 advertises VHT Beamformee STS Capability 3 (four space-time
+streams) like the other mt7996 chips, but it only has two spatial streams
+on 5 GHz. As a client of a 4x4 VHT AP at 160 MHz (AVM FRITZ!Box 7530), the
+downlink collapses as soon as the AP starts explicit beamforming towards
+it: UDP loss grows within seconds, TCP stalls for seconds at a time, and
+retransmits reach the thousands. The link recovers when idle and breaks
+again within a burst. A different station next to it stayed steady.
+
+Clearing SU beamformee from the association request makes the link stable,
+and advertising two space-time streams keeps beamforming usable. Measured
+with a GL.iNet GL-MT3600BE (MT7990) as a station at 160 MHz, iperf3 against
+a wired host through the AP, otherwise identical firmware and driver:
+
+                      TCP down          TCP retransmits
+  STS 4 (before)      6 - 92 Mbit/s     500 - 2000 per run
+  STS 2 (after)       782 - 839 Mbit/s  0
+
+UDP at 600 Mbit/s offered load lost up to 70% before and 0.2% (at 800
+Mbit/s offered) after.
+
+Use the value for two streams on MT7990 and leave MT7992 and MT7996
+unchanged.
+
+Signed-off-by: Eugene Bykov <omedius@gmail.com>
+Link: https://github.com/openwrt/mt76/pull/1153
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ mt7996/init.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+--- a/mt7996/init.c
++++ b/mt7996/init.c
+@@ -1351,6 +1351,8 @@ void mt7996_set_stream_vht_txbf_caps(str
+ 
+ 	if (is_mt7992(phy->mt76->dev))
+ 		*cap |= FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, 4);
++	else if (is_mt7990(phy->mt76->dev))
++		*cap |= FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, 1);
+ 	else
+ 		*cap |= FIELD_PREP(IEEE80211_VHT_CAP_BEAMFORMEE_STS_MASK, 3);
+ 
