@@ -1,0 +1,40 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 24 Oct 2026 11:50:00 +0900
+Subject: [PATCH] net: ethernet: mtk_ppe: bind flows from their first packets
+
+The PPE reports an unbound flow to the CPU for binding once it has seen
+30 packets of it within a second.  A new TCP connection reaches that
+rate in its first round trips of slow start, while it sends its packets
+in bursts at line rate, so the bind usually takes effect in the middle
+of a burst.  The PPE then forwards the rest of the burst ahead of the
+packets it had already passed to the CPU.  Towards a WED device the CPU
+path goes through mac80211 and the driver's TX queues, and those packets
+reach the station after later ones: the sender takes them as lost and
+cuts its congestion window while it is still small.
+
+Report flows for binding from their first packets, so that they move to
+the PPE before their bursts grow.  The threshold only decides when a
+flow of the flow table moves to the PPE, not which flows are offloaded;
+flows below 30 packets per second are now bound as well.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+ drivers/net/ethernet/mediatek/mtk_ppe.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+--- a/drivers/net/ethernet/mediatek/mtk_ppe.c
++++ b/drivers/net/ethernet/mediatek/mtk_ppe.c
+@@ -1405,7 +1405,11 @@ void mtk_ppe_start(struct mtk_ppe *ppe)
+ 	      FIELD_PREP(MTK_PPE_BIND_LIMIT1_NON_L4, 1);
+ 	ppe_w32(ppe, MTK_PPE_BIND_LIMIT1, val);
+ 
+-	val = FIELD_PREP(MTK_PPE_BIND_RATE_BIND, 30) |
++	/* Report flows for binding from their first packets: a later bind
++	 * lands in a burst, and the PPE forwards the rest of it ahead of the
++	 * packets still on the CPU path.
++	 */
++	val = FIELD_PREP(MTK_PPE_BIND_RATE_BIND, 1) |
+ 	      FIELD_PREP(MTK_PPE_BIND_RATE_PREBIND, 1);
+ 	ppe_w32(ppe, MTK_PPE_BIND_RATE, val);
+ 
