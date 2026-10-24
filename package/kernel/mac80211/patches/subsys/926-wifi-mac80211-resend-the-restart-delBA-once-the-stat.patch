@@ -1,0 +1,126 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 24 Oct 2026 19:22:41 +0900
+Subject: [PATCH] wifi: mac80211: resend the restart delBA once the station is
+ heard
+
+After a hardware restart, ieee80211_reconfig() tears down the block ack
+sessions and sends their delBA frames as soon as the queues wake. The
+hardware has just restarted and may not know yet that a station is in
+power save, so it sends the frames while the station sleeps, and they
+are lost. A station that misses the delBA of its receive session keeps
+its transmit session and sends A-MPDUs that no session covers. If they
+are still acknowledged, it sends no BlockAckReq either, which would make
+mac80211 send a delBA. A driver that needs the receive session, for
+example for hardware reordering, then handles that traffic in a slower
+path until the station reassociates.
+
+Remember the TIDs whose receive session the restart tore down, and send
+their delBA again when a data frame from the station is received, unless
+a new session was set up in the meantime. By then the station is awake,
+or the hardware knows it is asleep and buffers the frame.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/net/mac80211/agg-rx.c
++++ b/net/mac80211/agg-rx.c
+@@ -460,6 +460,7 @@ end:
+ 	if (status == WLAN_STATUS_SUCCESS) {
+ 		__set_bit(tid, sta->ampdu_mlme.agg_session_valid);
+ 		__clear_bit(tid, sta->ampdu_mlme.unexpected_agg);
++		clear_bit(tid, &sta->ampdu_mlme.tid_rx_restart_delba);
+ 		sta->ampdu_mlme.tid_rx_token[tid] = dialog_token;
+ 	}
+ 
+--- a/net/mac80211/rx.c
++++ b/net/mac80211/rx.c
+@@ -1858,6 +1858,27 @@ ieee80211_rx_h_uapsd_and_pspoll(struct i
+ 	return RX_CONTINUE;
+ }
+ 
++static void ieee80211_rx_restart_delba(struct sta_info *sta)
++{
++	unsigned long tids;
++	unsigned int tid;
++
++	/* see ieee80211_reconfig() */
++	if (likely(!READ_ONCE(sta->ampdu_mlme.tid_rx_restart_delba)))
++		return;
++
++	tids = xchg(&sta->ampdu_mlme.tid_rx_restart_delba, 0);
++	for_each_set_bit(tid, &tids, IEEE80211_NUM_TIDS) {
++		if (test_bit(tid, sta->ampdu_mlme.agg_session_valid))
++			continue;
++
++		ieee80211_send_delba(sta->sdata, sta->sta.addr, tid,
++				     WLAN_BACK_RECIPIENT,
++				     WLAN_REASON_QSTA_LEAVE_QBSS,
++				     ieee80211_s1g_use_ndp_ba(sta->sdata, sta));
++	}
++}
++
+ static ieee80211_rx_result debug_noinline
+ ieee80211_rx_h_sta_process(struct ieee80211_rx_data *rx)
+ {
+@@ -1958,6 +1979,9 @@ ieee80211_rx_h_sta_process(struct ieee80
+ 	if (ieee80211_vif_is_mesh(&rx->sdata->vif))
+ 		ieee80211_mps_rx_h_sta_process(sta, hdr);
+ 
++	if (ieee80211_is_data(hdr->frame_control))
++		ieee80211_rx_restart_delba(sta);
++
+ 	/*
+ 	 * Drop (qos-)data::nullfunc frames silently, since they
+ 	 * are used only to control station power saving mode.
+@@ -4940,6 +4964,8 @@ static void ieee80211_rx_8023(struct iee
+ 	if (fast_rx->uses_rss)
+ 		stats = this_cpu_ptr(link_sta->pcpu_rx_stats);
+ 
++	ieee80211_rx_restart_delba(sta);
++
+ 	/* statistics part of ieee80211_rx_h_sta_process() */
+ 	if (!(status->flag & RX_FLAG_NO_SIGNAL_VAL)) {
+ 		stats->last_signal = status->signal;
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -276,6 +276,9 @@ struct tid_ampdu_rx {
+  * @agg_session_valid: bitmap indicating which TID has a rx BA session open on
+  * @unexpected_agg: bitmap indicating which TID already sent a delBA due to
+  *	unexpected aggregation related frames outside a session
++ * @tid_rx_restart_delba: bitmap indicating which TID lost its rx BA session
++ *	in a hardware restart, to send the delBA again when the station is
++ *	heard
+  * @work: work struct for starting/stopping aggregation
+  * @tid_tx: aggregation info for Tx per TID
+  * @tid_start_tx: sessions where start was requested, not just protected
+@@ -293,6 +296,7 @@ struct sta_ampdu_mlme {
+ 	unsigned long tid_rx_manage_offl[BITS_TO_LONGS(2 * IEEE80211_NUM_TIDS)];
+ 	unsigned long agg_session_valid[BITS_TO_LONGS(IEEE80211_NUM_TIDS)];
+ 	unsigned long unexpected_agg[BITS_TO_LONGS(IEEE80211_NUM_TIDS)];
++	unsigned long tid_rx_restart_delba;
+ 	/* tx */
+ 	struct wiphy_work work;
+ 	struct tid_ampdu_tx __rcu *tid_tx[IEEE80211_NUM_TIDS];
+--- a/net/mac80211/util.c
++++ b/net/mac80211/util.c
+@@ -2317,12 +2317,19 @@ int ieee80211_reconfig(struct ieee80211_
+ 	 * right now, and the hardware will have lost information
+ 	 * about the sessions, but we and the AP still think they
+ 	 * are active. This is really a workaround though.
++	 *
++	 * The hardware may not know yet that a station is asleep, and
++	 * send the delBA while the station cannot hear it. Send it again
++	 * once the station is heard.
+ 	 */
+ 	if (ieee80211_hw_check(hw, AMPDU_AGGREGATION)) {
+ 		list_for_each_entry(sta, &local->sta_list, list) {
+-			if (!local->resuming)
++			if (!local->resuming) {
++				sta->ampdu_mlme.tid_rx_restart_delba |=
++					sta->ampdu_mlme.agg_session_valid[0];
+ 				ieee80211_sta_tear_down_BA_sessions(
+ 						sta, AGG_STOP_LOCAL_REQUEST);
++			}
+ 			clear_sta_flag(sta, WLAN_STA_BLOCK_BA);
+ 		}
+ 	}
