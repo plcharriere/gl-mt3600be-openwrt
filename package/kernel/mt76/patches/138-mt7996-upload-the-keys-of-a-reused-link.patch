@@ -1,0 +1,58 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Fri, 30 Oct 2026 21:09:32 +0900
+Subject: [PATCH] wifi: mt76: mt7996: upload the keys of a reused link
+
+hostapd sets the group key of an AP before it starts the AP.  The link has
+no channel context at that point, so mt7996_set_hw_key() skips the key and
+mt7996_vif_link_add() uploads it when the channel context is assigned.
+
+A link that already exists goes through mt7996_vif_link_reuse() instead,
+which uploads no keys.  This is the case for an AP on a DFS channel: the
+CAC sets up the link, and the link stays valid when the channel context is
+released at the end of the CAC.  mac80211 considers the group key uploaded,
+but the firmware has no group key and no cipher for the BSS.
+
+A 4-way handshake hides this, because hostapd sets the group key again for
+the first station, now with a channel context.  A station that arrives by
+FT has no handshake.  Until another station has completed one, it stays
+associated but does not get the data frames sent to it.
+
+Upload the keys in mt7996_vif_link_reuse() as well.
+
+Fixes: e995f6198d8b ("wifi: mt76: mt7996: fix key add/remove imbalance")
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -380,6 +380,10 @@ static int mt7996_vif_link_reuse(struct
+ 				 struct mt7996_vif_link *link)
+ {
+ 	struct mt76_vif_link *mlink = &link->mt76;
++	struct mt7996_key_iter_data it = {
++		.cmd = SET_KEY,
++		.link_id = link_conf->link_id,
++	};
+ 	int ret;
+ 
+ 	ret = mt7996_mcu_add_dev_info(phy, vif, link_conf, mlink, true);
+@@ -387,10 +391,17 @@ static int mt7996_vif_link_reuse(struct
+ 		return ret;
+ 
+ 	if (vif->type == NL80211_IFTYPE_AP && ieee80211_vif_is_mld(vif))
+-		return mt7996_mcu_mld_link_oper(phy->dev, link_conf, link, true);
++		ret = mt7996_mcu_mld_link_oper(phy->dev, link_conf, link, true);
++	else
++		ret = mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink,
++					      &link->msta_link, true);
++	if (ret)
++		return ret;
++
++	/* keys set while the link had no channel context were not uploaded */
++	ieee80211_iter_keys(phy->mt76->hw, vif, mt7996_key_iter, &it);
+ 
+-	return mt7996_mcu_add_bss_info(phy, vif, link_conf, mlink,
+-				       &link->msta_link, true);
++	return 0;
+ }
+ 
+ int mt7996_vif_link_add(struct mt76_phy *mphy, struct ieee80211_vif *vif,
