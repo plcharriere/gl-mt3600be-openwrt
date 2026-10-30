@@ -1,0 +1,201 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Fri, 30 Oct 2026 00:42:53 +0900
+Subject: [PATCH] wifi: mt76: mt7996: take MT7990 RX rate from firmware report
+
+mt7996 leaves the receive bitrate of a station to mac80211, which takes it
+from the last data frame that reached the host.  With WED, the frames of
+flows offloaded to the PPE never reach the host.  The reported rate then
+comes from the few frames that still do, such as frames for the local host
+and the first packets of new flows, and does not follow the station's
+traffic.
+
+The UNI_ALL_STA_TXRX_RATE report that mt7996_mac_work() requests every
+500 ms also carries the receive rate, and MediaTek's driver reports it for
+this reason.  MT7990 already takes its TX rate from this report.  Convert
+the RX fields as well, with the same conversion, and report the result in
+mt7996_sta_statistics().  The RX fields use the RX vector encoding: a
+hardware rate value for legacy rates, the full HT MCS index and a stream
+count starting from 0.
+
+Until the firmware has reported a receive rate, mac80211 keeps reporting
+the rate of the last frame that reached the host.  A legacy rate reported
+for an HT or newer station before any other rate is ignored, as for the TX
+rate.  A full firmware recovery reuses the station's default link, so
+clear the cached rate when the link is initialized.
+
+MT7996 and MT7992 keep the current behaviour.
+
+Link: https://github.com/mediatek/mtk-openwrt-feeds/blob/f7eec2ff2e4fc8ded3439d7805c0aaa030ef9e07/autobuild/unified/filogic/mac80211/24.10/files/package/kernel/mt76/patches/0017-mtk-mt76-mt7996-update-TX-RX-rates-via-MCU-command.patch
+Based-on-patch-by: Benjamin Lin <benjamin-jw.lin@mediatek.com>
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1294,6 +1294,7 @@ mt7996_mac_sta_init_link(struct mt7996_d
+ 	INIT_LIST_HEAD(&msta_link->rc_list);
+ 	INIT_LIST_HEAD(&msta_link->wcid.poll_list);
+ 	memset(&msta_link->wcid.rate, 0, sizeof(msta_link->wcid.rate));
++	memset(&msta_link->rx_rate, 0, sizeof(msta_link->rx_rate));
+ 	msta_link->sta = msta;
+ 	msta_link->connected = false;
+ 	msta_link->wcid.tx_info = 0;
+@@ -2535,6 +2536,14 @@ static void mt7996_sta_statistics(struct
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+ 	}
+ 
++	/* Until the firmware has reported a receive rate, mac80211 reports
++	 * the rate of the last frame that reached the host.
++	 */
++	if (msta_link->rx_rate.legacy || msta_link->rx_rate.flags) {
++		sinfo->rxrate = msta_link->rx_rate;
++		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
++	}
++
+ 	sinfo->tx_failed = msta_link->wcid.stats.tx_failed;
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+ 
+--- a/mt7996/mcu.c
++++ b/mt7996/mcu.c
+@@ -701,18 +701,15 @@ mt7996_mcu_wcid_has_ht(struct mt76_wcid
+ }
+ 
+ static int
+-mt7996_mcu_update_tx_rate(struct mt7996_dev *dev, struct mt76_wcid *wcid,
+-			  struct all_sta_trx_rate *mcu_rate)
++mt7996_mcu_update_rate(struct mt7996_dev *dev, struct mt76_wcid *wcid,
++		       struct rate_info *cache, u8 mode, u8 mcs, u8 nss,
++		       u8 stbc, u8 gi, u8 bw, bool rx)
+ {
+ 	struct mt76_phy *mphy = mt76_dev_phy(&dev->mt76, wcid->phy_idx);
+ 	struct ieee80211_supported_band *sband;
+ 	struct rate_info rate = {};
+-	u8 mode = mcu_rate->tx_mode;
+-	u8 mcs = mcu_rate->tx_mcs;
+-	u8 nss = mcu_rate->tx_nss;
+-	u8 gi = mcu_rate->tx_gi;
+ 
+-	if (mcu_rate->tx_stbc && nss > 1)
++	if (stbc && nss > 1)
+ 		nss /= 2;
+ 
+ 	switch (mode) {
+@@ -722,8 +719,8 @@ mt7996_mcu_update_tx_rate(struct mt7996_
+ 		 * 6 Mbit/s.  Ignore that placeholder while the cache is empty,
+ 		 * but preserve genuine legacy fallback rates reported later.
+ 		 */
+-		if (mt7996_mcu_wcid_has_ht(wcid) && !wcid->rate.legacy &&
+-		    !wcid->rate.flags)
++		if (mt7996_mcu_wcid_has_ht(wcid) && !cache->legacy &&
++		    !cache->flags)
+ 			return 0;
+ 
+ 		if (!mphy->chandef.chan)
+@@ -736,10 +733,15 @@ mt7996_mcu_update_tx_rate(struct mt7996_
+ 		} else {
+ 			sband = &mphy->sband_2g.sband;
+ 			/* the 2.4 GHz rate table starts with four CCK rates */
+-			if (mode == MT_PHY_TYPE_OFDM)
++			if (mode == MT_PHY_TYPE_OFDM && !rx)
+ 				mcs += 4;
+ 		}
+ 
++		/* the RX rate is a hardware rate value, as in the RX vector */
++		if (rx)
++			mcs = mt76_get_rate(&dev->mt76, sband, mcs,
++					    mode == MT_PHY_TYPE_CCK);
++
+ 		if (mcs >= sband->n_bitrates)
+ 			return -EINVAL;
+ 
+@@ -747,10 +749,18 @@ mt7996_mcu_update_tx_rate(struct mt7996_
+ 		break;
+ 	case MT_PHY_TYPE_HT:
+ 	case MT_PHY_TYPE_HT_GF:
+-		if (!nss || mcs > 7 || nss > 4)
+-			return -EINVAL;
++		/* the RX rate is the HT MCS index, the TX rate per stream */
++		if (rx) {
++			if (mcs > 31)
++				return -EINVAL;
++		} else {
++			if (!nss || mcs > 7 || nss > 4)
++				return -EINVAL;
++
++			mcs += (nss - 1) * 8;
++		}
+ 
+-		rate.mcs = mcs + (nss - 1) * 8;
++		rate.mcs = mcs;
+ 		rate.flags = RATE_INFO_FLAGS_MCS;
+ 		if (gi)
+ 			rate.flags |= RATE_INFO_FLAGS_SHORT_GI;
+@@ -795,7 +805,7 @@ mt7996_mcu_update_tx_rate(struct mt7996_
+ 		return -EINVAL;
+ 	}
+ 
+-	switch (mcu_rate->tx_bw) {
++	switch (bw) {
+ 	case IEEE80211_STA_RX_BW_20:
+ 		rate.bw = RATE_INFO_BW_20;
+ 		break;
+@@ -820,11 +830,36 @@ mt7996_mcu_update_tx_rate(struct mt7996_
+ 		rate.he_ru_alloc = NL80211_RATE_INFO_HE_RU_ALLOC_106;
+ 	}
+ 
+-	wcid->rate = rate;
++	*cache = rate;
+ 
+ 	return 0;
+ }
+ 
++static int
++mt7996_mcu_update_tx_rate(struct mt7996_dev *dev, struct mt76_wcid *wcid,
++			  struct all_sta_trx_rate *mcu_rate)
++{
++	return mt7996_mcu_update_rate(dev, wcid, &wcid->rate,
++				      mcu_rate->tx_mode, mcu_rate->tx_mcs,
++				      mcu_rate->tx_nss, mcu_rate->tx_stbc,
++				      mcu_rate->tx_gi, mcu_rate->tx_bw, false);
++}
++
++static int
++mt7996_mcu_update_rx_rate(struct mt7996_dev *dev, struct mt76_wcid *wcid,
++			  struct all_sta_trx_rate *mcu_rate)
++{
++	struct mt7996_sta_link *msta_link;
++
++	msta_link = container_of(wcid, struct mt7996_sta_link, wcid);
++
++	/* as in the RX vector, rx_nsts counts the streams from 0 */
++	return mt7996_mcu_update_rate(dev, wcid, &msta_link->rx_rate,
++				      mcu_rate->rx_mode, mcu_rate->rx_rate,
++				      mcu_rate->rx_nsts + 1, mcu_rate->rx_stbc,
++				      mcu_rate->rx_gi, mcu_rate->rx_bw, true);
++}
++
+ static void
+ mt7996_mcu_rx_all_sta_info_event(struct mt7996_dev *dev, struct sk_buff *skb)
+ {
+@@ -881,6 +916,11 @@ mt7996_mcu_rx_all_sta_info_event(struct
+ 							      &res->rate[i]))
+ 					dev_err(dev->mt76.dev,
+ 						"Failed to update TX rate\n");
++				if (wcid->sta &&
++				    mt7996_mcu_update_rx_rate(dev, wcid,
++							      &res->rate[i]))
++					dev_err(dev->mt76.dev,
++						"Failed to update RX rate\n");
+ 				break;
+ 			}
+ 
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -306,6 +306,8 @@ struct mt7996_sta_link {
+ 	int ack_signal;
+ 	struct ewma_avg_signal avg_ack_signal;
+ 
++	struct rate_info rx_rate;
++
+ 	unsigned long changed;
+ 
+ 	struct mt76_connac_sta_key_conf bip;
