@@ -1,0 +1,95 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 31 Oct 2026 05:30:00 +0900
+Subject: [PATCH] wifi: mt76: mt7996: keep a WCID on its band
+
+Adding a station on a band pauses its WCID on the other bands, in the
+per-band station pause maps of the TX scheduler, and the pause stays
+when the station goes. A later station that gets the WCID on one of
+these bands starts paused, although it is awake and the PSM bit of its
+WTBL entry is clear. Its frames stay in the PLE until it enters and
+leaves power save. STA_REC_PS_LEAVE and VOW_DRR_CTRL_STA_PAUSE do not
+lift the pause.
+
+This is the path of a station that joins a 2.4 GHz BSS while a 5 GHz BSS
+waits for its CAC and then moves to 5 GHz. When its ADDBA responses stay
+in the queue, the station gives up on aggregation until a new session
+starts.
+
+Do not give a station a WCID that another band has used while a free one
+is left.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/mt7996/mt7996.h
++++ b/mt7996/mt7996.h
+@@ -539,6 +539,8 @@
+ 
+ 	u32 hw_pattern;
+ 
++	u32 wcid_band_mask[__MT_MAX_BAND][DIV_ROUND_UP(MT76_N_WCIDS, 32)];
++
+ 	u8 eeprom_mode;
+ 	bool has_eht:1;
+ 
+--- a/mt7996/main.c
++++ b/mt7996/main.c
+@@ -1354,6 +1354,49 @@
+ 	return msta->deflink_id;
+ }
+ 
++static bool
++mt7996_wcid_on_other_band(struct mt7996_dev *dev, int idx, u8 band_idx)
++{
++	int i;
++
++	for (i = 0; i < __MT_MAX_BAND; i++)
++		if (i != band_idx &&
++		    (dev->wcid_band_mask[i][idx / 32] & BIT(idx % 32)))
++			return true;
++
++	return false;
++}
++
++/* The WCID of a station stays paused on the other bands, and the pause is only
++ * lifted when a station on that band leaves power save. Keep a WCID on its band.
++ */
++static int
++mt7996_wcid_alloc(struct mt7996_dev *dev, u8 band_idx)
++{
++	u32 *mask = dev->mt76.wcid_mask;
++	int idx;
++
++	for (idx = 0; idx < MT7996_WTBL_STA; idx++) {
++		if (mask[idx / 32] & BIT(idx % 32))
++			continue;
++
++		if (mt7996_wcid_on_other_band(dev, idx, band_idx))
++			continue;
++
++		mask[idx / 32] |= BIT(idx % 32);
++		goto out;
++	}
++
++	idx = mt76_wcid_alloc(mask, MT7996_WTBL_STA);
++	if (idx < 0)
++		return idx;
++
++out:
++	dev->wcid_band_mask[band_idx][idx / 32] |= BIT(idx % 32);
++
++	return idx;
++}
++
+ static int
+ mt7996_mac_sta_init_link(struct mt7996_dev *dev,
+ 			 struct ieee80211_link_sta *link_sta,
+@@ -1368,7 +1411,7 @@
+ 	if (!phy)
+ 		return -EINVAL;
+ 
+-	idx = mt76_wcid_alloc(dev->mt76.wcid_mask, MT7996_WTBL_STA);
++	idx = mt7996_wcid_alloc(dev, phy->mt76->band_idx);
+ 	if (idx < 0)
+ 		return -ENOSPC;
+ 
