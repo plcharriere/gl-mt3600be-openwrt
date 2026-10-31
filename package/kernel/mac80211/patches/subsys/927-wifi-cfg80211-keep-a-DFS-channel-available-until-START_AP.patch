@@ -1,0 +1,26 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 31 Oct 2026 03:50:00 +0900
+Subject: [PATCH] wifi: cfg80211: keep a DFS channel available until START_AP
+
+A DFS channel stays available for a grace period after its AP stops, so
+that the AP can restart without a new CAC. hostapd sets the channel with
+NL80211_CMD_SET_WIPHY and sends START_AP once the rest of the BSS is set
+up. If the grace period ends between the two, START_AP fails with
+-EINVAL and the interface stays disabled until the next restart.
+
+Count the grace period again from the request that sets the channel.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -4188,6 +4188,8 @@
+ 		if (!cfg80211_reg_can_beacon_relax(&rdev->wiphy, &chandef,
+ 						   iftype))
+ 			return -EINVAL;
++		/* a DFS channel must stay available until START_AP */
++		cfg80211_update_last_available(&rdev->wiphy, &chandef);
+ 		if (wdev->links[link_id].ap.beacon_interval) {
+ 			struct ieee80211_channel *cur_chan;
+ 
