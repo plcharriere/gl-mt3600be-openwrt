@@ -1,0 +1,82 @@
+From: Paul-Louis Charrière <plcharriere@gmail.com>
+Date: Sat, 31 Oct 2026 03:50:00 +0900
+Subject: [PATCH] DFS: Run a CAC when the kernel refuses a channel whose CAC was
+ skipped
+
+hostapd reads the DFS state of its channels once, when the interface
+starts. With a channel still marked available it skips the CAC and goes
+on to hostapd_set_freq(). The kernel can expire the channel in between,
+for example during the scan for 40 MHz neighbours, which runs after the
+read. The expiry event does not reach a BSS that has no frequency yet,
+so the cached state stays available, the kernel refuses the channel and
+the interface stays disabled until the next restart.
+
+When the kernel refuses a channel that looked available, mark it usable
+and start a CAC, as a start with the current state would have done.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Paul-Louis Charrière <plcharriere@gmail.com>
+---
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3950,6 +3950,8 @@
+ 					     hapd->iconf),
+ 				     hostapd_get_oper_centr_freq_seg1_idx(
+ 					     hapd->iconf))) {
++			if (hostapd_dfs_restart_cac(iface) == 0)
++				return 0;
+ 			wpa_printf(MSG_ERROR, "Could not set channel for "
+ 				   "kernel driver");
+ 			goto fail;
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -970,6 +970,39 @@
+ }
+ 
+ 
++/*
++ * The kernel refused a channel whose CAC was skipped, because the CAC result
++ * expired after the channel list was read. Run a new CAC instead.
++ */
++int hostapd_dfs_restart_cac(struct hostapd_iface *iface)
++{
++	struct hostapd_channel_data *channel;
++	int n_chans, n_chans1, start_chan_idx, start_chan_idx1, i;
++
++	if ((iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD) ||
++	    hostapd_is_dfs_required(iface) <= 0 ||
++	    !hostapd_is_dfs_chan_available(iface))
++		return -1;
++
++	start_chan_idx = dfs_get_start_chan_idx(iface, &start_chan_idx1);
++	if (start_chan_idx == -1)
++		return -1;
++
++	n_chans = dfs_get_used_n_chans(iface, &n_chans1);
++
++	wpa_printf(MSG_INFO, "DFS: CAC result expired, running a new CAC");
++
++	for (i = 0; i < n_chans; i++) {
++		channel = &iface->current_mode->channels[start_chan_idx + i];
++		if (channel->flag & HOSTAPD_CHAN_RADAR)
++			set_dfs_state_freq(iface, channel->freq,
++					   HOSTAPD_CHAN_DFS_USABLE);
++	}
++
++	return hostapd_handle_dfs(iface);
++}
++
++
+ int hostapd_is_dfs_chan_available(struct hostapd_iface *iface)
+ {
+ 	int n_chans, n_chans1, start_chan_idx, start_chan_idx1;
+--- a/src/ap/dfs.h
++++ b/src/ap/dfs.h
+@@ -10,6 +10,7 @@
+ #define DFS_H
+ 
+ int hostapd_handle_dfs(struct hostapd_iface *iface);
++int hostapd_dfs_restart_cac(struct hostapd_iface *iface);
+ 
+ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			     int ht_enabled, int chan_offset, int chan_width,
